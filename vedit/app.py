@@ -23,9 +23,11 @@ from PySide6.QtWidgets import (
 )
 
 from vedit import theme
+from vedit.core.project import Project
 from vedit.pages.edit_page import EditPage
 from vedit.pages.media_page import MediaPage
 from vedit.pages.render_page import RenderPage
+from vedit.timeline import ops
 
 PAGES = ("Media", "Edit", "Render")
 
@@ -72,14 +74,25 @@ class PageBar(QWidget):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self):
+    def __init__(self, project: Project | None = None):
         super().__init__()
         self.setWindowTitle("vedit")
         self.resize(1600, 950)
 
-        self.media_page = MediaPage()
-        self.edit_page = EditPage()
-        self.render_page = RenderPage()
+        self.project = project or Project()
+
+        self.media_page = MediaPage(self.project)
+        self.edit_page = EditPage(self.project)
+        self.render_page = RenderPage(self.project)
+
+        # Sending media to the timeline is what moves you between pages, so both
+        # routes into the Edit page live here rather than inside a page.
+        self.media_page.append_requested.connect(self.append_media)
+        self.media_page.media_activated.connect(self.append_media)
+        self.project.pool.import_failed.connect(self._on_import_failed)
+        self.project.proxies.failed.connect(
+            lambda media_id, why: self.statusBar().showMessage(f"Ingest failed: {why}", 8000)
+        )
 
         self.stack = QStackedWidget()
         for page in (self.media_page, self.edit_page, self.render_page):
@@ -116,6 +129,29 @@ class MainWindow(QMainWindow):
     def show_page(self, index: int) -> None:
         self.stack.setCurrentIndex(index)
         self.page_bar.select(index)
+
+    # -- actions ---------------------------------------------------------------
+
+    def append_media(self, media_id: str) -> None:
+        """Put a pool item at the end of the timeline and switch to the Edit page."""
+        info = self.project.media_for(media_id)
+        if info is None:
+            return
+        try:
+            self.project.edit(f"Append {info.name}", lambda t: ops.append_media(t, info))
+        except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
+            self.statusBar().showMessage(str(exc), 8000)
+            return
+        self.show_page(1)
+        self.statusBar().showMessage(f"Appended {info.name}", 4000)
+
+    def _on_import_failed(self, path: str, reason: str) -> None:
+        self.statusBar().showMessage(f"Could not import {path}: {reason}", 8000)
+
+    def closeEvent(self, event) -> None:
+        # Stop ingest so ffmpeg children don't outlive the window.
+        self.project.shutdown()
+        super().closeEvent(event)
 
 
 def main() -> int:

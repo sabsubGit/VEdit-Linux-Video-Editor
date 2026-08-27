@@ -7,8 +7,9 @@ from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
 
 
 class RenderPage(QWidget):
-    def __init__(self, parent=None):
+    def __init__(self, project, parent=None):
         super().__init__(parent)
+        self.project = project
         layout = QVBoxLayout(self)
         placeholder = QLabel("Export settings and render queue")
         placeholder.setObjectName("PlaceholderLabel")
