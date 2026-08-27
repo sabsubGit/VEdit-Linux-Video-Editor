@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vedit"
+version = "0.1.0"
+description = "A simple, fast video editor for Linux"
+requires-python = ">=3.11"
+dependencies = [
+    "PySide6>=6.6",
+    "av>=14",
+]
+
+[project.scripts]
+vedit = "vedit.__main__:main"
+
+[tool.setuptools.packages.find]
+include = ["vedit*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
