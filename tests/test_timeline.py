@@ -245,6 +245,32 @@ class TestDeletion:
         assert linked.tracks[0].clips[0].tl_start == 0
         assert linked.tracks[1].clips[0].tl_start == 0
 
+    def test_ripple_delete_closes_only_its_own_span(self, timeline):
+        """A ripple closes the hole it made and nothing else.
+
+        Gaps the user created by trimming must survive, shifted — a ripple that
+        also swallowed unrelated gaps would silently rewrite parts of the edit
+        the user never touched.
+        """
+        for kind, index in (("video", 0), ("audio", 1)):
+            for number, start in enumerate((0, 60, 160)):
+                timeline.tracks[index].insert(
+                    make_clip(start, 60, src_length=200, kind=kind, link=f"L{number}")
+                )
+        # Trim the first clip short, opening a gap at 30..60.
+        ops.trim(timeline, timeline.tracks[0].clips[0], "out", 30)
+        assert timeline.tracks[0].gaps() == [(30, 60), (120, 160)]
+
+        ops.ripple_delete(timeline, [timeline.tracks[0].clips[0]])
+
+        # The deleted 0..30 is closed; both other gaps just move back by 30.
+        assert [(c.tl_start, c.tl_end) for c in timeline.tracks[0].clips] == [(30, 90), (130, 190)]
+        assert timeline.tracks[0].gaps() == [(0, 30), (90, 130)]
+        # And audio tracked video exactly through all of it.
+        assert [(c.tl_start, c.tl_end) for c in timeline.tracks[1].clips] == [
+            (c.tl_start, c.tl_end) for c in timeline.tracks[0].clips
+        ]
+
     def test_ripple_delete_range(self, linked):
         ops.ripple_delete_range(linked, 50, 150)
         # 0-50 survives, 150-200 slides back to 50.

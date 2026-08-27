@@ -88,6 +88,8 @@ class TimelineCanvas(QWidget):
         self._trim_frame = 0
         self._drop_frame: int | None = None
         self._snap_line: int | None = None
+        # Armed so a brand-new window fits itself once it has real geometry.
+        self._auto_fit = True
         self.snapping = True
 
         project.timeline_changed.connect(self._on_model_changed)
@@ -550,6 +552,7 @@ class TimelineCanvas(QWidget):
 
     def wheelEvent(self, event) -> None:
         delta = event.angleDelta().y()
+        self.release_auto_fit()
         if event.modifiers() & Qt.ControlModifier:
             # Zoom about the pointer so the frame under the cursor stays put.
             anchor = event.position().x()
@@ -569,15 +572,42 @@ class TimelineCanvas(QWidget):
         self.px_per_frame = max(MIN_PX_PER_FRAME, min(MAX_PX_PER_FRAME, px_per_frame))
 
     def zoom_to_fit(self) -> None:
+        """Fit the whole timeline across the lanes.
+
+        If the widget has no usable width yet — fitting on a page that has not
+        been shown, or right after loading a project — the fit is deferred to the
+        next resize. Computing it against a placeholder width collapses the zoom
+        to its minimum and leaves the timeline apparently empty.
+
+        A fit stays armed until the user changes the zoom themselves, so the
+        timeline re-fits as the window and splitter settle rather than sticking
+        at whatever width happened to exist on the first layout pass.
+        """
+        self._auto_fit = True
+
+        lanes = self.width() - HEADER_WIDTH - 20
+        if lanes < 50:
+            return
+
         duration = self.timeline.duration
-        lanes = max(1, self.width() - HEADER_WIDTH - 20)
-        if duration <= 0:
-            self.set_zoom(2.0)
-        else:
-            self.set_zoom(lanes / duration)
+        self.set_zoom(2.0 if duration <= 0 else lanes / duration)
         self.scroll_x = 0.0
         self.zoom_changed.emit()
         self.update()
+
+    def release_auto_fit(self) -> None:
+        """Stop re-fitting on resize — the user has taken control of the zoom."""
+        self._auto_fit = False
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self._auto_fit:
+            self.zoom_to_fit()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        if self._auto_fit:
+            self.zoom_to_fit()
 
     def ensure_visible(self, frame: int) -> None:
         """Scroll so `frame` is on screen — used while playing back."""

@@ -62,18 +62,26 @@ class ExportSettings(QWidget):
         quality_row.addWidget(self.quality_label)
 
         self.width_box = QSpinBox()
-        self.width_box.setRange(16, 16384)
-        self.width_box.setSingleStep(2)
         self.height_box = QSpinBox()
-        self.height_box.setRange(16, 16384)
-        self.height_box.setSingleStep(2)
+        for box in (self.width_box, self.height_box):
+            box.setRange(16, 16384)
+            # Even dimensions only: yuv420p chroma is subsampled 2x, so an odd
+            # width or height makes most encoders fail outright.
+            box.setSingleStep(2)
+            box.setFixedWidth(84)
+            box.setAlignment(Qt.AlignRight)
+
+        self.match_button = QPushButton("Match timeline")
+        self.match_button.clicked.connect(self.match_timeline)
+
         size_row = QHBoxLayout()
+        size_row.setSpacing(6)
         size_row.addWidget(self.width_box)
         size_row.addWidget(QLabel("×"))
         size_row.addWidget(self.height_box)
-        self.match_button = QPushButton("Match timeline")
-        self.match_button.clicked.connect(self.match_timeline)
+        size_row.addSpacing(8)
         size_row.addWidget(self.match_button)
+        size_row.addStretch(1)
 
         self.name_edit = QLineEdit("timeline")
         self.folder_edit = QLineEdit(str(Path.home() / "Videos"))
@@ -122,7 +130,11 @@ class ExportSettings(QWidget):
     def current_preset(self) -> Preset:
         preset = self.presets[max(0, self.preset_box.currentIndex())]
         preset = preset.with_quality(self.quality.value())
-        return preset.with_size(self.width_box.value(), self.height_box.value())
+        # yuv420p subsamples chroma by two, so an odd dimension makes most
+        # encoders fail. The step is 2, but a typed value can still be odd.
+        width = self.width_box.value() - (self.width_box.value() % 2)
+        height = self.height_box.value() - (self.height_box.value() % 2)
+        return preset.with_size(width, height)
 
     def match_timeline(self) -> None:
         self.width_box.setValue(self.project.timeline.width)

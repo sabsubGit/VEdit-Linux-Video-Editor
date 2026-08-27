@@ -181,6 +181,7 @@ class EditPage(QWidget):
 
     def _zoom(self, factor: float) -> None:
         canvas = self.timeline_panel.canvas
+        canvas.release_auto_fit()
         canvas.set_zoom(canvas.px_per_frame * factor)
         canvas.zoom_changed.emit()
         canvas.update()
