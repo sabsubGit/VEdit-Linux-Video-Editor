@@ -90,6 +90,20 @@ class TimeBase:
         floor = exact.numerator // exact.denominator
         return floor if exact == floor else floor + 1
 
+    def source_frames(self, seconds: float | Fraction) -> int:
+        """Whole frames a source of this length can actually supply.
+
+        Deliberately floors rather than rounding up. A 5.005-second file on a
+        30 fps timeline contains 150 complete frames, not 151; claiming 151 makes
+        the timeline promise a frame that no renderer can produce, so the preview
+        and the export end up one frame apart.
+
+        The epsilon absorbs float noise, so a file reporting 9.99999999 seconds
+        still yields 300 frames at 30 fps rather than 299.
+        """
+        exact = Fraction(seconds) * self.fps + Fraction(1, 1000)
+        return max(0, exact.numerator // exact.denominator)
+
     def frame_duration(self) -> Fraction:
         """Length of a single frame in seconds."""
         return Fraction(1) / self.fps

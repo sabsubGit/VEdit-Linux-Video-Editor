@@ -6,11 +6,13 @@ workers, so pages don't reach into each other — they all talk to this.
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Callable
 
 from PySide6.QtCore import QObject, Signal
 
 from vedit.core.commands import UndoStack
+from vedit.core.projectfile import LoadResult, load_project, save_project
 from vedit.core.timebase import TimeBase
 from vedit.media.pool import MediaPool
 from vedit.media.probe import MediaInfo
@@ -107,6 +109,61 @@ class Project(QObject):
 
     def import_paths(self, paths: list) -> list[MediaInfo]:
         return self.pool.add_paths(paths)
+
+    # -- files -----------------------------------------------------------------
+
+    @property
+    def is_dirty(self) -> bool:
+        return self.undo.is_dirty
+
+    @property
+    def display_name(self) -> str:
+        return Path(self.path).stem if self.path else "Untitled"
+
+    def save_to(self, path: str | Path) -> Path:
+        """Write the project, storing only media the timeline actually uses."""
+        used = {clip.media_id for clip in self.timeline.all_clips()}
+        media = [info for info in self.pool.all_media() if info.media_id in used]
+        written = save_project(Path(path), self.timeline, media, self.playhead)
+        self.path = str(written)
+        self.undo.mark_clean()
+        return written
+
+    def load_from(self, path: str | Path) -> LoadResult:
+        """Replace this project's contents with the file's. Returns the result so
+        the caller can report any media that could not be relinked."""
+        result = load_project(Path(path))
+
+        self.timebase = result.timeline.timebase
+        self.timeline.timebase = result.timeline.timebase
+        self.timeline.width = result.timeline.width
+        self.timeline.height = result.timeline.height
+        self.timeline.sample_rate = result.timeline.sample_rate
+        self.timeline.tracks = result.timeline.tracks
+
+        self.pool.remove_ids([info.media_id for info in self.pool.all_media()])
+        self.pool.add_paths([info.path for info in result.media])
+
+        self.undo.clear()
+        self.undo.mark_clean()
+        self.path = str(path)
+        self._selected = []
+        self.set_playhead(result.playhead)
+        self.timeline_changed.emit()
+        self.selection_changed.emit()
+        return result
+
+    def reset(self) -> None:
+        """Start a new, empty project in place."""
+        self.timeline.tracks = Timeline.default(self.timebase).tracks
+        self.pool.remove_ids([info.media_id for info in self.pool.all_media()])
+        self.undo.clear()
+        self.undo.mark_clean()
+        self.path = None
+        self._selected = []
+        self.set_playhead(0)
+        self.timeline_changed.emit()
+        self.selection_changed.emit()
 
     def shutdown(self) -> None:
         self.proxies.shutdown()

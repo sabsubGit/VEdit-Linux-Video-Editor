@@ -64,6 +64,42 @@ class TestRounding:
         assert tb.seconds_to_frames_ceil(tb.frames_to_seconds(4)) == 4
 
 
+class TestSourceFrames:
+    """Guards a real one-frame mismatch: rounding a source length up made the
+    timeline claim a frame the file could not supply, so the export came out one
+    frame shorter than the timeline said it was."""
+
+    def test_partial_trailing_frame_is_not_counted(self):
+        tb = TimeBase(30)
+        # 5.005s at 30fps is 150.15 frames — only 150 of them are complete.
+        assert tb.source_frames(Fraction(5005, 1000)) == 150
+        assert tb.seconds_to_frames_ceil(Fraction(5005, 1000)) == 151
+
+    def test_exact_durations_are_unaffected(self):
+        assert TimeBase(30).source_frames(10) == 300
+        assert TimeBase(25).source_frames(8) == 200
+        # 30 frames at 29.97 is 30 * 1001/30000 seconds.
+        assert TimeBase(Fraction(30000, 1001)).source_frames(Fraction(1001, 1000)) == 30
+
+    def test_float_noise_does_not_lose_a_frame(self):
+        # A container reporting a hair under 10s must still yield 300 frames.
+        assert TimeBase(30).source_frames(9.99999999) == 300
+
+    def test_zero_and_tiny_durations(self):
+        tb = TimeBase(30)
+        assert tb.source_frames(0) == 0
+        assert tb.source_frames(Fraction(1, 1000)) == 0
+
+    @pytest.mark.parametrize("fps", ALL_RATES)
+    def test_never_exceeds_the_available_duration(self, fps):
+        tb = TimeBase(fps)
+        for millis in (1234, 5005, 8000, 33333, 60000):
+            seconds = Fraction(millis, 1000)
+            frames = tb.source_frames(seconds)
+            # The claimed frames must fit inside the source, allowing the epsilon.
+            assert tb.frames_to_seconds(frames) <= seconds + Fraction(1, 1000)
+
+
 class TestTimecode:
     @pytest.mark.parametrize("fps", ALL_RATES)
     def test_timecode_roundtrip(self, fps):

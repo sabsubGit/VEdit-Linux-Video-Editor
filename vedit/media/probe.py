@@ -87,12 +87,12 @@ class MediaInfo:
         return self.audio is not None
 
     def frame_count(self, timebase: TimeBase) -> int:
-        """Length in whole frames at `timebase`.
+        """Whole frames this source can supply at `timebase`.
 
-        Rounds up so the tail of a clip is never silently clipped off by a
-        fraction of a frame.
+        See `TimeBase.source_frames`: this floors, so the timeline never claims a
+        frame the file cannot deliver and the render matches the preview exactly.
         """
-        return timebase.seconds_to_frames_ceil(self.duration)
+        return timebase.source_frames(self.duration)
 
     def describe(self) -> str:
         """One-line summary for the pool's detail column."""

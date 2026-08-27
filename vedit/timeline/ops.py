@@ -34,7 +34,7 @@ def make_clips(info: MediaInfo, timebase: TimeBase, *, link: bool = True) -> lis
     video lane, one for the audio lane. That pairing is created at import time
     because retrofitting linkage onto existing edits is far harder.
     """
-    length = timebase.seconds_to_frames_ceil(info.duration)
+    length = timebase.source_frames(info.duration)
     if length < 1:
         raise TimelineError(f"{info.name} is shorter than one frame at the project rate")
 

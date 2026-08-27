@@ -20,3 +20,4 @@ include = ["vedit*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["slow: runs real ffmpeg renders"]
