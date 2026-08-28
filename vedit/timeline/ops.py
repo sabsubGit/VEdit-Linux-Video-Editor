@@ -19,7 +19,15 @@ from typing import Iterable, Literal, Sequence
 
 from vedit.core.timebase import TimeBase
 from vedit.media.probe import MediaInfo
-from vedit.timeline.model import Clip, Timeline, TimelineError, Track, new_id
+from vedit.timeline.model import (
+    MAX_SPEED,
+    MIN_SPEED,
+    Clip,
+    Timeline,
+    TimelineError,
+    Track,
+    new_id,
+)
 
 Edge = Literal["in", "out"]
 
@@ -159,22 +167,25 @@ def razor(timeline: Timeline, frame: int, tracks: Sequence[Track] | None = None)
         for clip in list(track.clips):
             if not clip.crosses(frame):
                 continue
-            offset = frame - clip.tl_start
+            # With a speed change the timeline offset and the source offset are
+            # different distances; splitting on the raw offset would move the cut.
+            source_offset = clip.source_span_for(frame - clip.tl_start)
             right_link = None
             if clip.link_id is not None:
                 right_link = rebound.setdefault(clip.link_id, new_id("l"))
             right = Clip(
                 media_id=clip.media_id,
-                src_in=clip.src_in + offset,
+                src_in=clip.src_in + source_offset,
                 src_out=clip.src_out,
                 tl_start=frame,
                 src_length=clip.src_length,
                 kind=clip.kind,
+                speed=clip.speed,
                 link_id=right_link,
                 name=clip.name,
                 enabled=clip.enabled,
             )
-            clip.src_out = clip.src_in + offset
+            clip.src_out = clip.src_in + source_offset
             track.clips.append(right)
             created.append(right)
         track.sort()
@@ -331,17 +342,22 @@ def _delta_bounds(timeline: Timeline, clip: Clip, edge: Edge) -> tuple[int, int]
     track = timeline.track_of(clip)
     before, after = track.neighbours(clip)
 
+    # Headroom is measured in source frames; a delta is in timeline frames. At
+    # 2x, 100 spare source frames only buy 50 frames of timeline.
+    speed = clip.speed or 1.0
+    head_room_tl = int(clip.head_room / speed)
+    tail_room_tl = int(clip.tail_room / speed)
+
     if edge == "in":
         # Negative delta drags the in-point earlier, which needs head material.
-        from_source = -clip.head_room
+        from_source = -head_room_tl
         from_neighbour = (before.tl_end if before else 0) - clip.tl_start
         low = max(from_source, from_neighbour)
         high = clip.duration - 1
     else:
         low = -(clip.duration - 1)
-        from_source = clip.tail_room
         from_neighbour = (after.tl_start - clip.tl_end) if after else math.inf
-        high = int(min(from_source, from_neighbour))
+        high = int(min(tail_room_tl, from_neighbour))
     return low, high
 
 
@@ -368,11 +384,12 @@ def trim(timeline: Timeline, clip: Clip, edge: Edge, new_frame: int) -> int:
     delta = int(max(low, min(high, desired)))
 
     for member in group:
+        source_delta = member.source_span_for(delta)
         if edge == "in":
-            member.src_in += delta
+            member.src_in = max(0, member.src_in + source_delta)
             member.tl_start += delta
         else:
-            member.src_out += delta
+            member.src_out = min(member.src_length, member.src_out + source_delta)
 
     for track in timeline.tracks:
         track.sort()
@@ -433,3 +450,73 @@ def close_gap(timeline: Timeline, track: Track, frame: int) -> bool:
                 other.sort()
             return True
     return False
+
+
+# -- speed --------------------------------------------------------------------
+
+
+def set_speed(timeline: Timeline, clips: Sequence[Clip], speed: float) -> None:
+    """Change clip playback speed, keeping the in-point fixed.
+
+    The clip's source window is unchanged — only how long it takes to play
+    through it. So the clip's head stays where it is and its tail moves, which
+    is what you want when retiming something already positioned on the timeline.
+
+    Applied to the whole link group, so picture and sound retime together.
+    Later clips are *not* rippled: a retime leaves a gap or an overlap for the
+    editor to resolve, rather than silently rearranging the rest of the edit.
+    """
+    if speed <= 0:
+        raise TimelineError("speed must be greater than zero")
+    speed = max(MIN_SPEED, min(MAX_SPEED, float(speed)))
+
+    group = expand_links(timeline, clips)
+    if not group:
+        return
+    _assert_unlocked(timeline, group)
+
+    for clip in group:
+        track = timeline.track_of(clip)
+        _, after = track.neighbours(clip)
+        previous_speed = clip.speed
+        clip.speed = speed
+
+        # Slowing a clip makes it longer, which can run it into its neighbour.
+        # Pull the out-point in rather than refusing the retime outright.
+        if after is not None and clip.tl_end > after.tl_start:
+            available = after.tl_start - clip.tl_start
+            if available < 1:
+                clip.speed = previous_speed
+                raise TimelineError(
+                    f"no room to slow {clip.name or 'clip'} down here — "
+                    f"move the next clip first"
+                )
+            clip.src_out = min(
+                clip.src_length, clip.src_in + max(1, clip.source_span_for(available))
+            )
+
+
+def clip_speed(timeline: Timeline, clip: Clip) -> float:
+    return clip.speed
+
+
+# -- tracks -------------------------------------------------------------------
+
+
+def add_track(timeline: Timeline, kind: str) -> Track:
+    return timeline.add_track(kind)
+
+
+def remove_track(timeline: Timeline, track: Track) -> None:
+    """Remove a lane and its clips, then renumber what is left."""
+    timeline.remove_track(track)
+    timeline.renumber_tracks()
+
+
+def clear_track(timeline: Timeline, track: Track) -> None:
+    """Empty a lane without removing it."""
+    if track.locked:
+        raise TimelineError(f"track {track.name} is locked")
+    # Linked partners on other lanes are left alone: clearing V2 should not
+    # silently delete audio the user can still see on A1.
+    track.clips.clear()

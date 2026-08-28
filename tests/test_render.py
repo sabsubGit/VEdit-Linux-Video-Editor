@@ -43,7 +43,6 @@ def timeline():
 
 
 def add(timeline, media_id, tl_start, length, *, src_in=0, kind="video", track=None):
-    index = 0 if kind == "video" else 1
     clip = Clip(
         media_id=media_id,
         src_in=src_in,
@@ -52,7 +51,7 @@ def add(timeline, media_id, tl_start, length, *, src_in=0, kind="video", track=N
         src_length=src_in + length + 500,
         kind=kind,
     )
-    (track or timeline.tracks[index]).insert(clip)
+    (track or timeline.lane_for(kind)).insert(clip)
     return clip
 
 

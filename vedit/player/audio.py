@@ -1,4 +1,4 @@
-"""Audio playback and the master clock.
+"""Audio playback, mixing and the master clock.
 
 `QAudioSink` is used rather than PortAudio/sounddevice so the app needs no audio
 dependency beyond PySide6 itself. It is fed in *pull* mode: Qt calls `readData`
@@ -8,6 +8,11 @@ sets the pace and we never have to guess at buffer timing.
 `clock_frame()` is the value the whole player synchronises to. It is derived from
 how many sample frames the device has actually consumed, which is the one number
 that matches what a listener is hearing at that instant.
+
+Several audio lanes play at once, so each lane gets a `_LaneReader` that hands
+out PCM on demand and the mixer sums them. Pulling a fixed block from every lane
+and adding is what keeps the lanes sample-aligned; letting each lane write into
+the buffer at its own pace would drift them apart within seconds.
 """
 
 from __future__ import annotations
@@ -113,12 +118,191 @@ class _SinkDevice(QIODevice):
         return True
 
 
+class _LaneReader:
+    """Reads one audio lane as a continuous PCM stream.
+
+    Hands back exactly as many samples as asked for, padding with silence for
+    gaps and for sources that end early, so the mixer can add lanes together
+    without worrying about which of them currently has content.
+    """
+
+    def __init__(self, playlist: Playlist, timebase: TimeBase, start_frame: int) -> None:
+        self.playlist = playlist
+        self.timebase = timebase
+        self.position = start_frame
+        self._pending = np.zeros(0, dtype=np.int16)
+        self._container = None
+        self._segment: Segment | None = None
+        self._frames = None
+        self._resampler = None
+
+    def close(self) -> None:
+        if self._container is not None:
+            try:
+                self._container.close()
+            except Exception:
+                pass
+            self._container = None
+        self._frames = None
+        self._segment = None
+
+    # -- reading ---------------------------------------------------------------
+
+    def read(self, wanted: int, stop: threading.Event) -> np.ndarray:
+        """`wanted` interleaved stereo sample-frames as int16."""
+        out = np.zeros(wanted * CHANNELS, dtype=np.int16)
+        filled = 0
+
+        while filled < wanted and not stop.is_set():
+            if self._pending.size == 0 and not self._refill(stop):
+                break  # nothing left anywhere; the rest stays silent
+            take = min(wanted - filled, self._pending.size // CHANNELS)
+            if take <= 0:
+                break
+            chunk = self._pending[: take * CHANNELS]
+            out[filled * CHANNELS : (filled + take) * CHANNELS] = chunk
+            self._pending = self._pending[take * CHANNELS :]
+            filled += take
+
+        return out
+
+    def _refill(self, stop: threading.Event) -> bool:
+        """Decode more audio into `_pending`. False once the timeline runs out."""
+        while not stop.is_set():
+            segment = self.playlist.at(self.position)
+            if segment is None:
+                return False
+
+            if segment.is_gap or segment.path is None:
+                remaining = segment.tl_end - self.position
+                samples = self._samples_for(remaining)
+                self._pending = np.zeros(samples * CHANNELS, dtype=np.int16)
+                self.position = segment.tl_end
+                self.close()
+                return True
+
+            if self._segment is None or self._segment is not segment:
+                if not self._open(segment):
+                    self.position = segment.tl_end
+                    continue
+
+            block = self._next_block(segment)
+            if block is None:
+                # Source ran dry before the segment did; pad the remainder.
+                remaining = max(0, segment.tl_end - self.position)
+                self._pending = np.zeros(self._samples_for(remaining) * CHANNELS, dtype=np.int16)
+                self.position = segment.tl_end
+                self.close()
+                return True
+
+            self._pending = block
+            return True
+        return False
+
+    def _samples_for(self, frames: int) -> int:
+        return max(0, int(round(float(self.timebase.frames_to_seconds(frames)) * SAMPLE_RATE)))
+
+    def _open(self, segment: Segment) -> bool:
+        self.close()
+        try:
+            container = av.open(str(segment.path))
+        except (av.error.FFmpegError, OSError):
+            return False
+        if not container.streams.audio:
+            container.close()
+            return False
+
+        stream = container.streams.audio[0]
+        seconds = segment.source_seconds(self.position, self.timebase)
+        try:
+            container.seek(int(seconds / float(stream.time_base)), stream=stream, backward=True)
+        except (av.error.FFmpegError, OSError):
+            container.close()
+            return False
+
+        self._container = container
+        self._segment = segment
+        self._stream = stream
+        self._frames = container.decode(stream)
+        self._resampler = av.AudioResampler(format="s16", layout="stereo", rate=SAMPLE_RATE)
+        self._seek_target = seconds
+        return True
+
+    def _next_block(self, segment: Segment) -> np.ndarray | None:
+        end_seconds = segment.source_seconds(segment.tl_end, self.timebase)
+        while True:
+            try:
+                frame = next(self._frames)
+            except (StopIteration, av.error.FFmpegError):
+                return None
+
+            frame_seconds = float((frame.pts or 0) * self._stream.time_base)
+            length = float(frame.samples) / float(frame.rate or SAMPLE_RATE)
+            if frame_seconds + length <= self._seek_target:
+                continue  # still before the in-point after a keyframe seek
+            if frame_seconds >= end_seconds:
+                return None
+
+            resampled = self._resampler.resample(frame)
+            if not resampled:
+                continue
+
+            pieces = [self._flatten(r.to_ndarray()) for r in resampled]
+            data = np.concatenate(pieces) if len(pieces) > 1 else pieces[0]
+            data = self._trim(data, frame_seconds, self._seek_target, end_seconds)
+            if data.size == 0:
+                continue
+
+            if segment.speed != 1.0:
+                data = self._retime(data, segment.speed)
+
+            advance = data.size // CHANNELS
+            self.position += self.timebase.seconds_to_frames(advance / SAMPLE_RATE)
+            return data
+
+    @staticmethod
+    def _flatten(data: np.ndarray) -> np.ndarray:
+        return data.reshape(-1) if data.ndim == 1 else data.T.reshape(-1)
+
+    @staticmethod
+    def _trim(data: np.ndarray, frame_seconds: float, start: float, end: float) -> np.ndarray:
+        """Cut a decoded block to the part inside the clip's in/out points.
+
+        Without this the first block after a seek replays audio from before the
+        in-point, which is heard as a stutter at every cut.
+        """
+        total = data.size // CHANNELS
+        if total == 0:
+            return data[:0]
+        lead = min(int(max(0.0, start - frame_seconds) * SAMPLE_RATE), total)
+        tail = min(int(max(0.0, end - frame_seconds) * SAMPLE_RATE), total)
+        if tail <= lead:
+            return data[:0]
+        return data[lead * CHANNELS : tail * CHANNELS]
+
+    @staticmethod
+    def _retime(data: np.ndarray, speed: float) -> np.ndarray:
+        """Resample for a speed change.
+
+        Straight index resampling, so pitch rises and falls with speed like a
+        tape machine. The renderer uses `asetrate` for the same reason: a
+        pitch-preserving preview would not match the exported file.
+        """
+        pairs = data.size // CHANNELS
+        if pairs == 0:
+            return data
+        out_pairs = max(1, int(pairs / speed))
+        picks = np.minimum((np.arange(out_pairs) * speed).astype(np.int64), pairs - 1)
+        stereo = data.reshape(-1, CHANNELS)
+        return stereo[picks].reshape(-1)
+
+
 class AudioStreamer:
     """Decodes the audio playlist into PCM and plays it through QAudioSink."""
 
     def __init__(self, timebase: TimeBase) -> None:
         self.timebase = timebase
-        self._playlist = Playlist([], 0)
+        self._playlists: list[Playlist] = []
         self._start_frame = 0
 
         capacity = int(SAMPLE_RATE * TARGET_BUFFER_SECONDS) * BYTES_PER_FRAME
@@ -133,10 +317,10 @@ class AudioStreamer:
 
     # -- setup ------------------------------------------------------------------
 
-    def set_playlist(self, playlist: Playlist, position: int) -> None:
+    def set_playlists(self, playlists: list[Playlist], position: int) -> None:
         was_active = self._active
         self.stop()
-        self._playlist = playlist
+        self._playlists = list(playlists)
         if was_active:
             self.start(position)
 
@@ -149,7 +333,11 @@ class AudioStreamer:
         return fmt
 
     def _has_audio(self) -> bool:
-        return any(not segment.is_gap for segment in self._playlist.segments)
+        return any(
+            not segment.is_gap
+            for playlist in self._playlists
+            for segment in playlist.segments
+        )
 
     # -- transport --------------------------------------------------------------
 
@@ -235,83 +423,42 @@ class AudioStreamer:
         return bytes(int(seconds * SAMPLE_RATE) * BYTES_PER_FRAME)
 
     def _run(self) -> None:
-        position = self._start_frame
+        """Pull an equal block from every lane, sum them, and hand it on.
+
+        Mixing in int32 before clipping back to int16 matters: summing two loud
+        lanes directly in int16 wraps around, which is heard as a loud crackle
+        rather than as distortion.
+        """
+        readers = [
+            _LaneReader(playlist, self.timebase, self._start_frame)
+            for playlist in self._playlists
+        ]
+        block = max(256, int(SAMPLE_RATE * 0.05))
+
         try:
             while not self._stop.is_set():
-                segment = self._playlist.at(position)
-                if segment is None:
+                if not readers:
                     self._ring.set_eof()
                     return
-                if not self._feed_segment(segment, position):
+
+                mixed = np.zeros(block * CHANNELS, dtype=np.int32)
+                alive = False
+                for reader in readers:
+                    if reader.playlist.at(reader.position) is not None:
+                        alive = True
+                    mixed += reader.read(block, self._stop)
+
+                if self._stop.is_set():
                     return
-                position = segment.tl_end
+                if not alive:
+                    self._ring.set_eof()
+                    return
+
+                np.clip(mixed, -32768, 32767, out=mixed)
+                if not self._ring.write(mixed.astype(np.int16).tobytes(), stop=self._stop):
+                    return
         except Exception:  # noqa: BLE001 - a bad file silences audio, nothing worse
             self._ring.set_eof()
-
-    def _feed_segment(self, segment: Segment, from_frame: int) -> bool:
-        if segment.is_gap or segment.path is None:
-            return self._ring.write(
-                self._silence(segment.tl_end - from_frame), stop=self._stop
-            )
-        return self._feed_file(segment, from_frame)
-
-    def _feed_file(self, segment: Segment, from_frame: int) -> bool:
-        try:
-            container = av.open(str(segment.path))
-        except (av.error.FFmpegError, OSError):
-            return self._ring.write(self._silence(segment.tl_end - from_frame), stop=self._stop)
-
-        try:
-            if not container.streams.audio:
-                return self._ring.write(
-                    self._silence(segment.tl_end - from_frame), stop=self._stop
-                )
-            stream = container.streams.audio[0]
-
-            start_seconds = segment.source_seconds(from_frame, self.timebase)
-            end_seconds = segment.source_seconds(segment.tl_end, self.timebase)
-            container.seek(
-                int(start_seconds / float(stream.time_base)),
-                stream=stream,
-                backward=True,
-            )
-
-            resampler = self._resampler()
-            for frame in container.decode(stream):
-                if self._stop.is_set():
-                    return False
-
-                frame_seconds = float((frame.pts or 0) * stream.time_base)
-                if frame_seconds + float(frame.samples) / (frame.rate or SAMPLE_RATE) < start_seconds:
-                    continue  # still before the in-point after the keyframe seek
-                if frame_seconds >= end_seconds:
-                    break
-
-                for resampled in resampler.resample(frame):
-                    data = resampled.to_ndarray()
-                    pcm = self._trim(data, frame_seconds, start_seconds, end_seconds)
-                    if pcm.size and not self._ring.write(pcm.tobytes(), stop=self._stop):
-                        return False
-            return True
         finally:
-            container.close()
-
-    @staticmethod
-    def _trim(data: np.ndarray, frame_seconds: float, start: float, end: float) -> np.ndarray:
-        """Cut a decoded block down to the part inside the clip's in/out points.
-
-        Without this the first block after a seek would replay audio from before
-        the in-point, which is heard as a stutter at every cut.
-        """
-        samples = data.reshape(-1) if data.ndim == 1 else data.T.reshape(-1)
-        total_pairs = samples.size // CHANNELS
-        if total_pairs == 0:
-            return samples[:0]
-
-        lead = int(max(0.0, start - frame_seconds) * SAMPLE_RATE)
-        tail_limit = int(max(0.0, end - frame_seconds) * SAMPLE_RATE)
-        first = min(lead, total_pairs)
-        last = min(tail_limit, total_pairs)
-        if last <= first:
-            return samples[:0]
-        return samples[first * CHANNELS : last * CHANNELS]
+            for reader in readers:
+                reader.close()

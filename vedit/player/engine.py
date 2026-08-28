@@ -18,7 +18,7 @@ from vedit.core.project import Project
 from vedit.player.audio import AudioStreamer
 from vedit.player.clock import MasterClock
 from vedit.player.decoder import VideoDecoder
-from vedit.player.segments import build_playlist
+from vedit.player.segments import audio_playlists, build_video_playlist
 from vedit.player.surface import VideoSurface
 
 
@@ -61,17 +61,19 @@ class PlaybackEngine(QObject):
         self._stale = True
 
     def _rebuild(self) -> None:
+        """Flatten the timeline into what the decoders should read.
+
+        Video collapses every lane into one playlist with the topmost clip
+        winning; audio stays one playlist per lane so the mixer can sum them.
+        """
         timeline = self.project.timeline
-        video_track = timeline.video_tracks[0] if timeline.video_tracks else None
-        audio_track = timeline.audio_tracks[0] if timeline.audio_tracks else None
+        pool, proxies = self.project.pool, self.project.proxies
 
         self.video.set_playlist(
-            build_playlist(timeline, video_track, self.project.pool, self.project.proxies),
-            self._position,
+            build_video_playlist(timeline, pool, proxies), self._position
         )
-        self.audio.set_playlist(
-            build_playlist(timeline, audio_track, self.project.pool, self.project.proxies),
-            self._position,
+        self.audio.set_playlists(
+            audio_playlists(timeline, pool, proxies), self._position
         )
         self._stale = False
 

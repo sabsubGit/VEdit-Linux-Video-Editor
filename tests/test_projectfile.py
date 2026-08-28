@@ -47,8 +47,8 @@ def project(clip_file):
     timeline = Timeline.default(timebase)
     length = info.frame_count(timebase)
 
-    for kind, index in (("video", 0), ("audio", 1)):
-        timeline.tracks[index].insert(
+    for kind in ("video", "audio"):
+        timeline.lane_for(kind).insert(
             Clip(
                 media_id=info.media_id,
                 src_in=10,
@@ -60,7 +60,7 @@ def project(clip_file):
                 name=info.name,
             )
         )
-    timeline.tracks[1].muted = True
+    timeline.audio_tracks[0].muted = True
     return timeline, [info]
 
 
@@ -75,8 +75,8 @@ class TestRoundTrip:
         assert result.timeline.timebase == timeline.timebase
         assert (result.timeline.width, result.timeline.height) == (1920, 1080)
 
-        original = timeline.tracks[0].clips[0]
-        loaded = result.timeline.tracks[0].clips[0]
+        original = timeline.video_tracks[0].clips[0]
+        loaded = result.timeline.video_tracks[0].clips[0]
         assert (loaded.src_in, loaded.src_out, loaded.tl_start, loaded.src_length) == (
             original.src_in, original.src_out, original.tl_start, original.src_length
         )
@@ -86,8 +86,8 @@ class TestRoundTrip:
         save_project(tmp_path / "p.vedit", timeline, media)
         result = load_project(tmp_path / "p.vedit")
 
-        assert result.timeline.tracks[1].muted is True
-        video = result.timeline.tracks[0].clips[0]
+        assert result.timeline.audio_tracks[0].muted is True
+        video = result.timeline.video_tracks[0].clips[0]
         assert len(result.timeline.linked_group(video)) == 2, "A/V pairing survived"
 
     def test_fractional_rate_survives_exactly(self, clip_file, tmp_path):
@@ -108,7 +108,7 @@ class TestRoundTrip:
         payload = json.loads(path.read_text())
         assert payload["format"] == "vedit-project"
         assert payload["version"] == FORMAT_VERSION
-        assert len(payload["tracks"]) == 2
+        assert len(payload["tracks"]) == 6
 
     def test_only_used_media_is_written(self, project, tmp_path, clip_file):
         timeline, media = project
@@ -137,7 +137,7 @@ class TestMissingMedia:
         assert result.missing == ["/nonexistent/gone.mp4"]
         # The project still opens; it just has no clips for that media.
         assert sum(len(track.clips) for track in result.timeline.tracks) == 0
-        assert len(result.timeline.tracks) == 2
+        assert len(result.timeline.tracks) == 6, "the lanes themselves survive"
 
 
 class TestRejections:
@@ -169,4 +169,4 @@ class TestRejections:
         path = tmp_path / "bare.vedit"
         path.write_text(json.dumps({"format": "vedit-project", "version": 1}))
         result = load_project(path)
-        assert [track.name for track in result.timeline.tracks] == ["V1", "A1"]
+        assert [track.name for track in result.timeline.tracks] == ["V1", "V2", "V3", "A1", "A2", "A3"]

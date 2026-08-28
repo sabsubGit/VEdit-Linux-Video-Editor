@@ -152,9 +152,9 @@ class TestBuildPlaylist:
         from vedit.timeline.model import Clip, Timeline, Track
 
         timeline = Timeline.default(TimeBase(30))
-        track = timeline.tracks[0]
+        track = timeline.video_tracks[0]
         track.insert(Clip(media_id="m", src_in=0, src_out=50, tl_start=50, src_length=50))
-        timeline.tracks[1].insert(
+        timeline.audio_tracks[0].insert(
             Clip(media_id="m", src_in=0, src_out=50, tl_start=50, src_length=50, kind="audio")
         )
 

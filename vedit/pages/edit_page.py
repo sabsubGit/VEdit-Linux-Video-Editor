@@ -151,8 +151,7 @@ class EditPage(QWidget):
 
     def _build_actions(self) -> None:
         self._add("Play/Pause", Qt.Key_Space, self.engine.toggle)
-        self._add("Razor", "S", self.razor_at_playhead)
-        self._add("Razor (B)", "B", self.razor_at_playhead)
+        self._add("Razor", "X", self.razor_at_playhead)
         self._add("Ripple Delete", QKeySequence.Delete, self.ripple_delete_selection)
         self._add("Lift", Qt.Key_Backspace, self.lift_selection)
 

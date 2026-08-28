@@ -21,6 +21,11 @@ from vedit.core.timebase import TimeBase
 
 TrackKind = Literal["video", "audio"]
 
+# Beyond this range playback stops being useful and the decoder spends all its
+# time seeking; the UI offers a much narrower set of presets than this.
+MIN_SPEED = 0.1
+MAX_SPEED = 10.0
+
 _ids = itertools.count(1)
 
 
@@ -47,6 +52,7 @@ class Clip:
     tl_start: int
     src_length: int
     kind: TrackKind = "video"
+    speed: float = 1.0
     link_id: str | None = None
     clip_id: str = field(default_factory=lambda: new_id("c"))
     name: str = ""
@@ -64,12 +70,31 @@ class Clip:
             )
         if self.tl_start < 0:
             raise TimelineError(f"clip {self.name or self.clip_id}: cannot start before zero")
+        if not MIN_SPEED <= self.speed <= MAX_SPEED:
+            raise TimelineError(
+                f"clip {self.name or self.clip_id}: speed {self.speed} is outside "
+                f"{MIN_SPEED}x to {MAX_SPEED}x"
+            )
 
     # -- geometry --------------------------------------------------------------
 
     @property
-    def duration(self) -> int:
+    def source_span(self) -> int:
+        """Source frames the clip consumes. Independent of how long it plays for."""
         return self.src_out - self.src_in
+
+    @property
+    def duration(self) -> int:
+        """Timeline frames the clip occupies.
+
+        At 2x a clip eats two source frames per timeline frame, so it occupies
+        half the space. Deriving this from the source window rather than storing
+        it keeps the two from ever disagreeing; at the default 1.0 speed it is
+        exactly the source span, so the common path is unchanged.
+        """
+        if self.speed == 1.0:
+            return self.source_span
+        return max(1, round(self.source_span / self.speed))
 
     @property
     def tl_end(self) -> int:
@@ -88,7 +113,16 @@ class Clip:
 
     def source_frame_at(self, timeline_frame: int) -> int:
         """Which source frame is showing at a given timeline position."""
-        return self.src_in + (timeline_frame - self.tl_start)
+        offset = timeline_frame - self.tl_start
+        if self.speed == 1.0:
+            return self.src_in + offset
+        return self.src_in + int(round(offset * self.speed))
+
+    def source_span_for(self, timeline_frames: int) -> int:
+        """Source frames consumed by `timeline_frames` of playback at this speed."""
+        if self.speed == 1.0:
+            return timeline_frames
+        return int(round(timeline_frames * self.speed))
 
     # -- headroom for trimming -------------------------------------------------
 
@@ -241,13 +275,28 @@ class Timeline:
     tracks: list[Track] = field(default_factory=list)
 
     @classmethod
-    def default(cls, timebase: TimeBase | None = None, width: int = 1920, height: int = 1080) -> Timeline:
-        """A fresh timeline with one video and one audio lane."""
+    def default(
+        cls,
+        timebase: TimeBase | None = None,
+        width: int = 1920,
+        height: int = 1080,
+        *,
+        video_tracks: int = 3,
+        audio_tracks: int = 3,
+    ) -> Timeline:
+        """A fresh timeline with empty lanes ready to drop onto.
+
+        More than one of each by default: having somewhere to put a cutaway or a
+        music bed without first hunting for an "add track" command is what makes
+        a timeline feel usable straight away.
+        """
+        tracks = [Track(kind="video", name=f"V{n + 1}") for n in range(max(1, video_tracks))]
+        tracks += [Track(kind="audio", name=f"A{n + 1}") for n in range(max(1, audio_tracks))]
         return cls(
             timebase=timebase or TimeBase(30),
             width=width,
             height=height,
-            tracks=[Track(kind="video", name="V1"), Track(kind="audio", name="A1")],
+            tracks=tracks,
         )
 
     # -- lookups ---------------------------------------------------------------
@@ -301,6 +350,44 @@ class Timeline:
 
     def editable_tracks(self) -> list[Track]:
         return [track for track in self.tracks if not track.locked]
+
+    def lane_for(self, kind: TrackKind) -> Track:
+        """The first lane of a kind — where media lands unless told otherwise."""
+        lanes = self.video_tracks if kind == "video" else self.audio_tracks
+        if not lanes:
+            raise TimelineError(f"the timeline has no {kind} track")
+        return lanes[0]
+
+    def add_track(self, kind: TrackKind, *, index: int | None = None) -> Track:
+        """Add a lane, named after how many of its kind already exist."""
+        existing = self.video_tracks if kind == "video" else self.audio_tracks
+        track = Track(kind=kind, name=f"{'V' if kind == 'video' else 'A'}{len(existing) + 1}")
+        if index is None:
+            # Keep video lanes grouped above audio lanes.
+            position = len(self.video_tracks) if kind == "video" else len(self.tracks)
+            self.tracks.insert(position, track)
+        else:
+            self.tracks.insert(index, track)
+        return track
+
+    def remove_track(self, track: Track) -> None:
+        """Remove a lane. The last lane of a kind stays, so there is always
+        somewhere for imported media to land."""
+        siblings = self.video_tracks if track.kind == "video" else self.audio_tracks
+        if len(siblings) <= 1:
+            raise TimelineError(f"cannot remove the last {track.kind} track")
+        self.tracks = [t for t in self.tracks if t.track_id != track.track_id]
+
+    def renumber_tracks(self) -> None:
+        """Rename lanes to be contiguous after one is removed."""
+        for index, track in enumerate(self.video_tracks):
+            track.name = f"V{index + 1}"
+        for index, track in enumerate(self.audio_tracks):
+            track.name = f"A{index + 1}"
+
+    def video_priority(self, track: Track) -> int:
+        """Higher wins when lanes overlap: V2 covers V1."""
+        return self.video_tracks.index(track)
 
     def media_ids(self) -> list[str]:
         seen: dict[str, None] = {}

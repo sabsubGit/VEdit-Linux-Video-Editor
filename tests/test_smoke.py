@@ -82,17 +82,17 @@ def test_import_cut_undo_render(sources, tmp_path):
 
     # 4s at 30fps = 120 frames; 3s at 25fps conformed to 30fps = 90 frames.
     assert timeline.duration == 210
-    assert [c.tl_start for c in timeline.tracks[0].clips] == [0, 120]
+    assert [c.tl_start for c in timeline.video_tracks[0].clips] == [0, 120]
 
     # -- cut ----------------------------------------------------------------
     undo.apply("razor", lambda t: ops.razor(t, 60))
-    assert len(timeline.tracks[0].clips) == 3
+    assert len(timeline.video_tracks[0].clips) == 3
 
-    tail = timeline.tracks[0].clips[1]
+    tail = timeline.video_tracks[0].clips[1]
     undo.apply("ripple", lambda t: ops.ripple_delete(t, [tail]))
     assert timeline.duration == 150, "removed 2s, closing the gap"
-    assert timeline.tracks[0].gaps() == [], "ripple left no hole"
-    assert timeline.tracks[1].clips[0].tl_end == 60, "audio rippled with video"
+    assert timeline.video_tracks[0].gaps() == [], "ripple left no hole"
+    assert timeline.audio_tracks[0].clips[0].tl_end == 60, "audio rippled with video"
 
     # -- undo / redo --------------------------------------------------------
     snapshot = [(c.clip_id, c.tl_start, c.src_in, c.src_out) for c in timeline.all_clips()]
@@ -139,7 +139,7 @@ def test_render_with_a_gap(sources, tmp_path):
     pool = Pool([info_a])
 
     ops.place_media(timeline, info_a, 60)      # 2s of nothing, then the clip
-    assert timeline.tracks[0].gaps() == [(0, 60)]
+    assert timeline.video_tracks[0].gaps() == [(0, 60)]
 
     output = tmp_path / "gap.mp4"
     preset = preset_by_key("h264_mp4").with_quality(30).with_size(320, 180)
@@ -152,3 +152,81 @@ def test_render_with_a_gap(sources, tmp_path):
     assert float(data["format"]["duration"]) == pytest.approx(expected, abs=0.05)
     video = next(s for s in data["streams"] if s["codec_type"] == "video")
     assert int(video["nb_frames"]) == timeline.duration
+
+
+def test_speed_change_renders_the_right_length(sources, tmp_path):
+    """A 2x clip must export at half its source length, in the file itself."""
+    info_a, _ = sources
+    timebase = TimeBase(30)
+    timeline = Timeline.default(timebase, width=320, height=180)
+    pool = Pool([info_a])
+
+    clips = ops.append_media(timeline, info_a)
+    assert timeline.duration == 120, "4s at 30fps"
+
+    ops.set_speed(timeline, clips, 2.0)
+    assert timeline.duration == 60, "2x halves the time it occupies"
+
+    output = tmp_path / "fast.mp4"
+    preset = preset_by_key("h264_mp4").with_quality(30).with_size(320, 180)
+    args = build_command(timeline, pool, preset, output, progress_to_stdout=False)
+    result = subprocess.run(args, capture_output=True, text=True)
+    assert result.returncode == 0, f"ffmpeg failed:\n{result.stderr[-2000:]}"
+
+    data = ffprobe(output)
+    video = next(s for s in data["streams"] if s["codec_type"] == "video")
+    assert int(video["nb_frames"]) == 60
+    assert float(data["format"]["duration"]) == pytest.approx(2.0, abs=0.1)
+
+
+def test_upper_video_lane_occludes_lower(sources, tmp_path):
+    """Rendering must match the preview's topmost-wins rule, and the covered
+    clip must resume at the right source frame afterwards."""
+    info_a, info_b = sources
+    timebase = TimeBase(30)
+    timeline = Timeline.default(timebase, width=320, height=180)
+    pool = Pool([info_a, info_b])
+
+    ops.place_media(timeline, info_a, 0)                       # V1: 0..120
+    over = ops.make_clips(info_b, timebase)[0]
+    over.tl_start = 40
+    over.src_out = over.src_in + 20                            # V2: 40..60
+    timeline.video_tracks[1].insert(over)
+
+    assert timeline.duration == 120
+
+    output = tmp_path / "layered.mp4"
+    preset = preset_by_key("h264_mp4").with_quality(30).with_size(320, 180)
+    args = build_command(timeline, pool, preset, output, progress_to_stdout=False)
+    result = subprocess.run(args, capture_output=True, text=True)
+    assert result.returncode == 0, f"ffmpeg failed:\n{result.stderr[-2000:]}"
+
+    data = ffprobe(output)
+    video = next(s for s in data["streams"] if s["codec_type"] == "video")
+    assert int(video["nb_frames"]) == 120, "the overlay covers, it does not extend"
+    assert float(data["format"]["duration"]) == pytest.approx(4.0, abs=0.1)
+
+
+def test_two_audio_lanes_are_mixed(sources, tmp_path):
+    info_a, info_b = sources
+    timebase = TimeBase(30)
+    timeline = Timeline.default(timebase, width=320, height=180)
+    pool = Pool([info_a, info_b])
+
+    ops.place_media(timeline, info_a, 0)
+    second = ops.make_clips(info_b, timebase)[1]     # audio half of the pair
+    second.tl_start = 0
+    timeline.audio_tracks[1].insert(second)
+
+    output = tmp_path / "mixed.mp4"
+    preset = preset_by_key("h264_mp4").with_quality(30).with_size(320, 180)
+    args = build_command(timeline, pool, preset, output, progress_to_stdout=False)
+    assert "amix=inputs=2" in args[args.index("-filter_complex") + 1]
+
+    result = subprocess.run(args, capture_output=True, text=True)
+    assert result.returncode == 0, f"ffmpeg failed:\n{result.stderr[-2000:]}"
+
+    data = ffprobe(output)
+    audio = next(s for s in data["streams"] if s["codec_type"] == "audio")
+    assert int(audio["channels"]) == 2
+    assert float(data["format"]["duration"]) == pytest.approx(4.0, abs=0.15)

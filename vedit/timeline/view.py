@@ -17,7 +17,7 @@ from enum import Enum, auto
 
 from PySide6.QtCore import QPoint, QRectF, Qt, Signal
 from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QPainter, QPen, QPolygon
-from PySide6.QtWidgets import QScrollBar, QVBoxLayout, QWidget
+from PySide6.QtWidgets import QHBoxLayout, QMenu, QScrollBar, QVBoxLayout, QWidget
 
 from vedit import theme
 from vedit.core.project import Project
@@ -31,6 +31,7 @@ HEADER_WIDTH = 108
 VIDEO_TRACK_HEIGHT = 70
 AUDIO_TRACK_HEIGHT = 56
 TRACK_GAP = 2
+CLIP_RADIUS = 7           # corner rounding on clip rectangles
 TRIM_GRAB_PX = 7          # how close to an edge counts as grabbing it
 SNAP_PX = 9               # snapping tolerance, in screen pixels
 MIN_PX_PER_FRAME = 0.002
@@ -71,6 +72,7 @@ class TimelineCanvas(QWidget):
 
         self.px_per_frame = 2.0
         self.scroll_x = 0.0
+        self.scroll_y = 0.0
 
         self.setFocusPolicy(Qt.StrongFocus)
         self.setMouseTracking(True)
@@ -134,7 +136,7 @@ class TimelineCanvas(QWidget):
         higher-numbered tracks stack upward, which is the layout every NLE uses.
         """
         rows: list[tuple[Track, int, int]] = []
-        y = RULER_HEIGHT + TRACK_GAP
+        y = RULER_HEIGHT + TRACK_GAP - int(self.scroll_y)
         for track in reversed(self.timeline.video_tracks):
             rows.append((track, y, VIDEO_TRACK_HEIGHT))
             y += VIDEO_TRACK_HEIGHT + TRACK_GAP
@@ -143,11 +145,28 @@ class TimelineCanvas(QWidget):
             y += AUDIO_TRACK_HEIGHT + TRACK_GAP
         return rows
 
+    def lanes_height(self) -> int:
+        """Total height every lane needs, ignoring how much is on screen."""
+        videos = len(self.timeline.video_tracks)
+        audios = len(self.timeline.audio_tracks)
+        return (
+            videos * (VIDEO_TRACK_HEIGHT + TRACK_GAP)
+            + audios * (AUDIO_TRACK_HEIGHT + TRACK_GAP)
+            + TRACK_GAP
+        )
+
+    def max_scroll_y(self) -> int:
+        return max(0, self.lanes_height() - (self.height() - RULER_HEIGHT))
+
     def content_height(self) -> int:
+        """Bottom of the drawable lane area, clamped to the widget."""
         rows = self.track_rows()
-        return (rows[-1][1] + rows[-1][2] + TRACK_GAP) if rows else RULER_HEIGHT + 40
+        bottom = (rows[-1][1] + rows[-1][2] + TRACK_GAP) if rows else RULER_HEIGHT + 40
+        return min(bottom, self.height())
 
     def track_at(self, y: int) -> tuple[Track, int, int] | None:
+        if y < RULER_HEIGHT:
+            return None
         for track, top, height in self.track_rows():
             if top <= y < top + height:
                 return track, top, height
@@ -228,11 +247,17 @@ class TimelineCanvas(QWidget):
         painter.setRenderHint(QPainter.Antialiasing, False)
         painter.fillRect(self.rect(), theme.BG_DARKEST)
 
+        # Everything below the ruler scrolls, so clip it or a lane scrolled up
+        # would paint over the timecode strip.
+        painter.save()
+        painter.setClipRect(0, RULER_HEIGHT, self.width(), self.height() - RULER_HEIGHT)
         self._paint_lanes(painter)
         self._paint_clips(painter)
         self._paint_drop_indicator(painter)
         self._paint_snap_line(painter)
         self._paint_headers(painter)
+        painter.restore()
+
         self._paint_ruler(painter)
         self._paint_playhead(painter)
         painter.end()
@@ -293,6 +318,13 @@ class TimelineCanvas(QWidget):
             painter.setPen(theme.TEXT if not track.muted else theme.TEXT_FAINT)
             painter.drawText(11, top + 19, track.name)
 
+            # A faint tint keeps video and audio lanes distinguishable when both
+            # are empty, which is the normal state of the spare lanes.
+            tint = theme.CLIP_VIDEO if track.kind == "video" else theme.CLIP_AUDIO
+            swatch = QColor(tint)
+            swatch.setAlpha(70 if not track.muted else 30)
+            painter.fillRect(0, top, 3, height, swatch)
+
             flags = []
             if track.muted:
                 flags.append("muted")
@@ -346,14 +378,14 @@ class TimelineCanvas(QWidget):
 
                 painter.setPen(Qt.NoPen)
                 painter.setBrush(QBrush(fill))
-                painter.drawRoundedRect(rect, 3, 3)
+                painter.drawRoundedRect(rect, CLIP_RADIUS, CLIP_RADIUS)
 
                 if clip.kind == "audio" and rect.width() > 4:
                     self._paint_waveform(painter, clip, rect)
 
                 painter.setPen(QPen(border, 2 if is_selected else 1))
                 painter.setBrush(Qt.NoBrush)
-                painter.drawRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), 3, 3)
+                painter.drawRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), CLIP_RADIUS, CLIP_RADIUS)
 
                 if rect.width() > 34:
                     label = metrics.elidedText(
@@ -412,6 +444,12 @@ class TimelineCanvas(QWidget):
     def mousePressEvent(self, event) -> None:
         self.setFocus()
         pos = event.position().toPoint()
+
+        if event.button() == Qt.RightButton:
+            # Right-click opens a menu; it must never scrub or begin a drag.
+            self._open_context_menu(pos, event.globalPosition().toPoint())
+            return
+
         self._press_pos = pos
         self._snap_line = None
 
@@ -548,6 +586,155 @@ class TimelineCanvas(QWidget):
             current = [clip.clip_id]
         self.project.set_selection(current)
 
+
+    # -- context menus ---------------------------------------------------------
+
+    SPEED_PRESETS = ((0.25, "¼×  Slow"), (0.5, "½×"), (1.0, "1×  Normal"),
+                     (2.0, "2×"), (4.0, "4×  Fast"))
+
+    def _open_context_menu(self, pos: QPoint, global_pos: QPoint) -> None:
+        if pos.x() < HEADER_WIDTH:
+            row = self.track_at(pos.y())
+            if row is not None:
+                self._track_menu(row[0], global_pos)
+            return
+
+        hit = self.hit_test(pos)
+        if hit is not None:
+            # Right-clicking outside the selection selects that clip first, so
+            # the menu always acts on what was actually clicked.
+            if hit.clip.clip_id not in self.project.selected_ids:
+                self.project.set_selection([hit.clip.clip_id])
+            self._clip_menu(hit.clip, global_pos)
+        else:
+            row = self.track_at(pos.y())
+            if row is not None:
+                self._track_menu(row[0], global_pos, empty_area=True)
+
+    def _clip_menu(self, clip: Clip, global_pos: QPoint) -> None:
+        self.build_clip_menu(clip).exec(global_pos)
+
+    def build_clip_menu(self, clip: Clip) -> QMenu:
+        menu = QMenu(self)
+        selected = self.project.selected_clips() or [clip]
+
+        menu.addAction("Cut at Playhead\tX", self._razor_here)
+        menu.addSeparator()
+
+        speed_menu = menu.addMenu("Speed")
+        for factor, label in self.SPEED_PRESETS:
+            action = speed_menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(abs(clip.speed - factor) < 1e-6)
+            action.triggered.connect(lambda _=False, f=factor: self._apply_speed(f))
+        speed_menu.addSeparator()
+        speed_menu.addAction("Custom…", lambda: self._custom_speed(clip))
+
+        if clip.speed != 1.0:
+            menu.addAction(f"Reset Speed (now {clip.speed:g}×)", lambda: self._apply_speed(1.0))
+
+        menu.addSeparator()
+        group = self.timeline.linked_group(clip)
+        if clip.link_id is not None and len(group) > 1:
+            menu.addAction("Unlink Audio and Video", lambda: self._run("Unlink", ops.unlink, clip))
+        elif len(selected) > 1:
+            menu.addAction("Link Selected", lambda: self._link(selected))
+
+        toggle = "Disable" if clip.enabled else "Enable"
+        menu.addAction(toggle, lambda: self._toggle_enabled(selected))
+
+        menu.addSeparator()
+        menu.addAction("Delete (leave gap)\tBackspace", lambda: self._delete(selected, ripple=False))
+        menu.addAction("Ripple Delete\tDelete", lambda: self._delete(selected, ripple=True))
+        return menu
+
+    def _track_menu(self, track: Track, global_pos: QPoint, *, empty_area: bool = False) -> None:
+        self.build_track_menu(track).exec(global_pos)
+
+    def build_track_menu(self, track: Track) -> QMenu:
+        menu = QMenu(self)
+
+        mute = menu.addAction("Mute" if not track.muted else "Unmute")
+        mute.triggered.connect(lambda: self._set_track_flag(track, "muted", not track.muted))
+        lock = menu.addAction("Lock" if not track.locked else "Unlock")
+        lock.triggered.connect(lambda: self._set_track_flag(track, "locked", not track.locked))
+
+        menu.addSeparator()
+        menu.addAction("Add Video Track", lambda: self._add_track("video"))
+        menu.addAction("Add Audio Track", lambda: self._add_track("audio"))
+
+        siblings = self.timeline.video_tracks if track.kind == "video" else self.timeline.audio_tracks
+        remove = menu.addAction(f"Delete Track {track.name}")
+        remove.triggered.connect(lambda: self._remove_track(track))
+        remove.setEnabled(len(siblings) > 1)
+
+        clear = menu.addAction(f"Clear Track {track.name}")
+        clear.triggered.connect(lambda: self._run("Clear track", ops.clear_track, track))
+        clear.setEnabled(bool(track.clips))
+        return menu
+
+    # -- menu actions ----------------------------------------------------------
+
+    def _run(self, label: str, func, *args) -> None:
+        try:
+            self.project.edit(label, lambda t: func(t, *args))
+        except TimelineError as exc:
+            self.status_message.emit(str(exc))
+
+    def _razor_here(self) -> None:
+        frame = self.project.playhead
+        if not self.project.edit("Razor", lambda t: ops.razor(t, frame)):
+            self.status_message.emit("Nothing to cut at the playhead")
+
+    def _apply_speed(self, factor: float) -> None:
+        clips = self.project.selected_clips()
+        if not clips:
+            return
+        self._run(f"Speed {factor:g}x", ops.set_speed, clips, factor)
+
+    def _custom_speed(self, clip: Clip) -> None:
+        from PySide6.QtWidgets import QInputDialog
+
+        factor, accepted = QInputDialog.getDouble(
+            self, "Clip speed", "Speed multiplier:", clip.speed, 0.1, 10.0, 2
+        )
+        if accepted:
+            self._apply_speed(factor)
+
+    def _toggle_enabled(self, clips: list[Clip]) -> None:
+        wanted = not clips[0].enabled
+
+        def apply(timeline: Timeline) -> None:
+            for clip in ops.expand_links(timeline, clips):
+                clip.enabled = wanted
+
+        self.project.edit("Enable clip" if wanted else "Disable clip", apply)
+
+    def _delete(self, clips: list[Clip], *, ripple: bool) -> None:
+        action = ops.ripple_delete if ripple else ops.lift
+        try:
+            self.project.edit("Ripple delete" if ripple else "Delete", lambda t: action(t, clips))
+            self.project.set_selection([])
+        except TimelineError as exc:
+            self.status_message.emit(str(exc))
+
+    def _link(self, clips: list[Clip]) -> None:
+        self.project.edit("Link clips", lambda t: ops.link(t, clips))
+
+    def _set_track_flag(self, track: Track, flag: str, value: bool) -> None:
+        setattr(track, flag, value)
+        # Muting changes what the player should read, so rebuild the playlists.
+        self.project.timeline_changed.emit()
+        self.update()
+
+    def _add_track(self, kind: str) -> None:
+        self.project.edit(f"Add {kind} track", lambda t: t.add_track(kind))
+        self.zoom_changed.emit()
+
+    def _remove_track(self, track: Track) -> None:
+        self._run("Delete track", ops.remove_track, track)
+        self.zoom_changed.emit()
+
     # -- wheel / zoom ----------------------------------------------------------
 
     def wheelEvent(self, event) -> None:
@@ -561,9 +748,18 @@ class TimelineCanvas(QWidget):
             self.scroll_x = frame_under * self.px_per_frame - (anchor - HEADER_WIDTH)
             self.scroll_x = max(0.0, self.scroll_x)
             self.zoom_changed.emit()
+        elif event.modifiers() & Qt.ShiftModifier:
+            self.scroll_x = max(0.0, self.scroll_x - (delta / 120) * 90)
+            self.zoom_changed.emit()
+        elif self.max_scroll_y() > 0:
+            # With several lanes, a bare wheel scrolls them vertically, which is
+            # what the extra tracks make people reach for first.
+            self.scroll_y = max(
+                0.0, min(float(self.max_scroll_y()), self.scroll_y - (delta / 120) * 40)
+            )
+            self.zoom_changed.emit()
         else:
-            step = 90 if event.modifiers() & Qt.ShiftModifier else 45
-            self.scroll_x = max(0.0, self.scroll_x - (delta / 120) * step)
+            self.scroll_x = max(0.0, self.scroll_x - (delta / 120) * 45)
             self.zoom_changed.emit()
         self.update()
         event.accept()
@@ -694,12 +890,20 @@ class TimelinePanel(QWidget):
 
         self.scrollbar = QScrollBar(Qt.Horizontal, self)
         self.scrollbar.valueChanged.connect(self._on_scroll)
+        self.vscrollbar = QScrollBar(Qt.Vertical, self)
+        self.vscrollbar.valueChanged.connect(self._on_vscroll)
         self.canvas.zoom_changed.connect(self._sync_scrollbar)
+
+        top = QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(0)
+        top.addWidget(self.canvas, 1)
+        top.addWidget(self.vscrollbar)
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
-        layout.addWidget(self.canvas, 1)
+        layout.addLayout(top, 1)
         layout.addWidget(self.scrollbar)
 
         self._syncing = False
@@ -716,10 +920,23 @@ class TimelinePanel(QWidget):
         self.scrollbar.setPageStep(lanes)
         self.scrollbar.setSingleStep(max(1, lanes // 12))
         self.scrollbar.setValue(int(self.canvas.scroll_x))
+
+        span = max(0, self.canvas.height() - RULER_HEIGHT)
+        self.vscrollbar.setRange(0, self.canvas.max_scroll_y())
+        self.vscrollbar.setPageStep(max(1, span))
+        self.vscrollbar.setSingleStep(24)
+        self.vscrollbar.setValue(int(self.canvas.scroll_y))
+        self.vscrollbar.setVisible(self.canvas.max_scroll_y() > 0)
         self._syncing = False
 
     def _on_scroll(self, value: int) -> None:
         if self._syncing:
             return
         self.canvas.scroll_x = float(value)
+        self.canvas.update()
+
+    def _on_vscroll(self, value: int) -> None:
+        if self._syncing:
+            return
+        self.canvas.scroll_y = float(value)
         self.canvas.update()

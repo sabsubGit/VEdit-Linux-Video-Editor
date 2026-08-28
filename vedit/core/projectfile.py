@@ -18,7 +18,7 @@ from pathlib import Path
 
 from vedit.core.timebase import TimeBase
 from vedit.media.probe import MediaInfo, UnsupportedMedia, probe
-from vedit.timeline.model import Clip, Timeline, Track
+from vedit.timeline.model import Clip, Timeline, Track  # noqa: F401
 
 FORMAT_VERSION = 1
 SUFFIX = ".vedit"
@@ -47,6 +47,7 @@ def _clip_to_dict(clip: Clip) -> dict:
         "tl_start": clip.tl_start,
         "src_length": clip.src_length,
         "kind": clip.kind,
+        "speed": clip.speed,
         "link_id": clip.link_id,
         "name": clip.name,
         "enabled": clip.enabled,
@@ -173,6 +174,7 @@ def load_project(path: Path) -> LoadResult:
                         tl_start=int(raw_clip["tl_start"]),
                         src_length=int(raw_clip["src_length"]),
                         kind=raw_clip.get("kind", kind),
+                        speed=float(raw_clip.get("speed", 1.0)),
                         link_id=raw_clip.get("link_id"),
                         name=raw_clip.get("name", ""),
                         enabled=bool(raw_clip.get("enabled", True)),
@@ -184,7 +186,7 @@ def load_project(path: Path) -> LoadResult:
         timeline.tracks.append(track)
 
     if not timeline.tracks:
-        timeline.tracks = [Track(kind="video", name="V1"), Track(kind="audio", name="A1")]
+        timeline.tracks = Timeline.default(timebase).tracks
 
     timeline.validate()
     return LoadResult(

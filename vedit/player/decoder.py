@@ -256,9 +256,7 @@ class VideoDecoder:
             position = self._source.seconds_of(frame)
             if position + tolerance < wanted:
                 continue
-            index = segment.tl_start + self.timebase.seconds_to_frames(
-                position - float(self.timebase.frames_to_seconds(segment.src_start))
-            )
+            index = segment.timeline_frame_for(position, self.timebase)
             with self._wake:
                 if generation != self._generation:
                     return
@@ -308,10 +306,7 @@ class VideoDecoder:
             return
 
         position_seconds = self._source.seconds_of(frame)
-        index = segment.tl_start + self.timebase.seconds_to_frames(
-            position_seconds - float(self.timebase.frames_to_seconds(segment.src_start))
-        )
-        index = max(index, segment.tl_start)
+        index = max(segment.timeline_frame_for(position_seconds, self.timebase), segment.tl_start)
 
         if index >= segment.tl_end:
             with self._wake:

@@ -15,7 +15,7 @@ from pathlib import Path
 from vedit.core.timebase import TimeBase
 from vedit.media.pool import MediaPool
 from vedit.media.proxy import ProxyManager
-from vedit.timeline.model import Timeline, Track
+from vedit.timeline.model import Clip, Timeline, Track
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +27,7 @@ class Segment:
     path: Path | None      # None means a gap: black video / silence
     src_start: int         # offset into the source, in timeline frames
     media_id: str = ""
+    speed: float = 1.0
 
     @property
     def duration(self) -> int:
@@ -38,8 +39,17 @@ class Segment:
 
     def source_seconds(self, timeline_frame: int, timebase: TimeBase) -> float:
         """Where to seek in the source for a given timeline position."""
-        offset = self.src_start + (timeline_frame - self.tl_start)
-        return float(timebase.frames_to_seconds(offset))
+        played = timeline_frame - self.tl_start
+        if self.speed != 1.0:
+            played = int(round(played * self.speed))
+        return float(timebase.frames_to_seconds(self.src_start + played))
+
+    def timeline_frame_for(self, source_seconds: float, timebase: TimeBase) -> int:
+        """Inverse of `source_seconds`: which timeline frame a decoded frame is for."""
+        source_frame = timebase.seconds_to_frames(source_seconds) - self.src_start
+        if self.speed != 1.0:
+            source_frame = source_frame / self.speed
+        return self.tl_start + int(round(source_frame))
 
 
 class Playlist:
@@ -108,6 +118,7 @@ def build_playlist(
                 path=path,
                 src_start=clip.src_in,
                 media_id=clip.media_id,
+                speed=clip.speed,
             )
         )
         cursor = clip.tl_end
@@ -116,3 +127,114 @@ def build_playlist(
         segments.append(Segment(cursor, duration, None, 0))
 
     return Playlist(segments, duration)
+
+
+def build_video_playlist(
+    timeline: Timeline,
+    pool: MediaPool,
+    proxies: ProxyManager,
+    *,
+    use_proxies: bool = True,
+) -> Playlist:
+    """Flatten every video lane into one playlist, topmost lane winning.
+
+    v1 has no opacity or transitions, so overlapping video is pure occlusion:
+    whatever is on the highest lane at a given frame is what you see. Splitting
+    the timeline at every clip edge across all lanes and then asking "who is on
+    top here?" gives exactly that, and collapses to the single-track case for
+    free when only V1 is used.
+    """
+    duration = timeline.duration
+    lanes = [t for t in timeline.video_tracks if not t.muted]
+    if not lanes or duration <= 0:
+        return Playlist([Segment(0, duration, None, 0)] if duration > 0 else [], duration)
+
+    # Every clip edge is a point where the winning lane can change.
+    edges = {0, duration}
+    for track in lanes:
+        for clip in track.clips:
+            edges.add(max(0, min(clip.tl_start, duration)))
+            edges.add(max(0, min(clip.tl_end, duration)))
+    boundaries = sorted(edges)
+
+    segments: list[Segment] = []
+    for start, end in zip(boundaries, boundaries[1:]):
+        if end <= start:
+            continue
+        winner: Clip | None = None
+        # Later lanes are higher, so the last match wins.
+        for track in lanes:
+            found = track.clip_at(start)
+            if found is not None and found.enabled:
+                winner = found
+
+        if winner is None:
+            segments.append(Segment(start, end, None, 0))
+            continue
+
+        info = pool.info_for(winner.media_id)
+        path = None
+        if info is not None:
+            path = proxies.playback_path(info) if use_proxies else info.path
+
+        segments.append(
+            Segment(
+                tl_start=start,
+                tl_end=end,
+                path=path,
+                # The visible span may start partway into the clip, so the source
+                # offset has to be measured from where this segment begins.
+                src_start=winner.source_frame_at(start),
+                media_id=winner.media_id,
+                speed=winner.speed,
+            )
+        )
+
+    return Playlist(_merge_adjacent(segments), duration)
+
+
+def _merge_adjacent(segments: list[Segment]) -> list[Segment]:
+    """Join segments that are really one continuous read.
+
+    Splitting at every edge across every lane produces neighbouring pieces of
+    the same clip; merging them back keeps the decoder from re-seeking a file it
+    is already positioned in.
+    """
+    merged: list[Segment] = []
+    for segment in segments:
+        if merged:
+            last = merged[-1]
+            continuous = (
+                last.tl_end == segment.tl_start
+                and last.path == segment.path
+                and last.media_id == segment.media_id
+                and last.speed == segment.speed
+                and (
+                    segment.is_gap
+                    or last.src_start + int(round((last.tl_end - last.tl_start) * last.speed))
+                    == segment.src_start
+                )
+            )
+            if continuous:
+                merged[-1] = Segment(
+                    last.tl_start, segment.tl_end, last.path, last.src_start,
+                    last.media_id, last.speed,
+                )
+                continue
+        merged.append(segment)
+    return merged
+
+
+def audio_playlists(
+    timeline: Timeline,
+    pool: MediaPool,
+    proxies: ProxyManager,
+    *,
+    use_proxies: bool = True,
+) -> list[Playlist]:
+    """One playlist per audible audio lane, for the mixer to sum."""
+    return [
+        build_playlist(timeline, track, pool, proxies, use_proxies=use_proxies)
+        for track in timeline.audio_tracks
+        if not track.muted and track.clips
+    ]

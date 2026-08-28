@@ -14,8 +14,8 @@ Three pages, mirroring how the work splits up.
 
 - **Media** — drag and drop files or folders into the pool. Thumbnails, waveform
   peaks and preview proxies generate in the background.
-- **Edit** — preview viewer with a scrubber, and a timeline with linked video and
-  audio lanes. Razor, trim, move, ripple delete, undo.
+- **Edit** — preview viewer with a scrubber, and a timeline with three video and
+  three audio lanes. Razor, trim, move, ripple delete, clip speed, undo.
 - **Render** — pick a preset and a destination, queue it, watch it go.
 
 ## Requirements
@@ -72,7 +72,7 @@ segment is normalised before concatenation.
 | `J` / `K` / `L` | Shuttle back / pause / shuttle forward |
 | `←` / `→` | Step one frame (`Shift` for one second) |
 | `Home` / `End` | Go to start / end |
-| `S` or `B` | Razor at the playhead |
+| `X` | Cut / split at the playhead |
 | `Delete` | Ripple delete (closes the gap) |
 | `Backspace` | Delete, leaving a gap |
 | `F` | Zoom timeline to fit |
@@ -83,7 +83,12 @@ segment is normalised before concatenation.
 | `Shift+1/2/3` | Media / Edit / Render page |
 
 Mouse: drag a clip body to move it, drag its edges to trim, `Ctrl`+wheel to zoom,
-click a track header to mute it, `Shift`-click to lock it.
+wheel to scroll lanes, `Shift`+wheel to scroll along the timeline. Click a track
+header to mute it, `Shift`-click to lock it.
+
+**Right-click a clip** for cut, speed (¼× to 4×, or a custom multiplier),
+link/unlink, enable/disable and delete. **Right-click a track header** to mute,
+lock, add, clear or delete lanes.
 
 ## How it works
 
@@ -129,6 +134,9 @@ frame-exact against what the timeline claims.
 
 ## Not there yet
 
-Transitions, effects, colour correction, multiple video layers with compositing,
-speed changes, and audio level automation. The model supports multiple tracks;
-the preview currently renders the topmost video track and the first audio track.
+Transitions, effects, colour correction, opacity/blending between video layers,
+and audio level automation.
+
+Multiple lanes work, but as pure occlusion: whatever sits on the highest video
+lane at a given frame is what you see, and all audio lanes are summed. Clip speed
+changes pitch with it, like a tape machine — there is no pitch correction.
