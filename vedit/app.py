@@ -9,7 +9,7 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QEvent, Qt, QTimer
 from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
@@ -39,6 +39,10 @@ PAGES = ("Media", "Edit", "Audio", "Render")
 # Pages that own a viewer. Switching to one of these hands it the shared engine's
 # picture; every other page leaves playback alone.
 VIEWER_PAGES = (1, 2)
+
+# Pause between dismissing the unsaved-changes dialog and destroying the window.
+# See closeEvent: this is not our bug to fix, but it is cheap to stop provoking.
+DIALOG_SETTLE_MS = 120
 
 
 class PageBar(QWidget):
@@ -89,6 +93,7 @@ class MainWindow(QMainWindow):
         self.resize(1600, 950)
 
         self.project = project or Project()
+        self._closing = False
 
         # One engine for the whole window. Every page that shows a viewer is
         # pointed at it in turn; two engines would mean two decoder threads and
@@ -227,13 +232,19 @@ class MainWindow(QMainWindow):
         """Ask before throwing away unsaved edits. True means "carry on"."""
         if not self.project.is_dirty:
             return True
-        answer = QMessageBox.question(
-            self,
+
+        # An explicit instance rather than QMessageBox.question, so the dialog
+        # can be told to delete itself. See closeEvent for why that matters.
+        box = QMessageBox(
+            QMessageBox.Question,
             "Unsaved changes",
             f"{self.project.display_name} has unsaved changes.\n\nSave before continuing?",
             QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
-            QMessageBox.Save,
+            self,
         )
+        box.setDefaultButton(QMessageBox.Save)
+        answer = box.exec()
+        box.deleteLater()
         if answer == QMessageBox.Cancel:
             return False
         if answer == QMessageBox.Save:
@@ -299,14 +310,48 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"Saved {written.name}", 4000)
         return True
 
-    def closeEvent(self, event) -> None:
-        if not self._confirm_discard():
-            event.ignore()
-            return
-        # Stop every child process so no ffmpeg outlives the window.
+    def _finish_close(self) -> None:
+        """Close once the dialog is genuinely gone, not merely hidden."""
+        # deleteLater only queues the destruction; flush it so the dialog's
+        # surface is really released before this window's goes too.
+        QApplication.sendPostedEvents(None, QEvent.DeferredDelete)
+        QApplication.processEvents()
+        self.close()
+
+    def _teardown(self) -> None:
+        """Stop every child process so no ffmpeg outlives the window."""
         self.engine.stop()
         self.render_page.shutdown()
         self.project.shutdown()
+
+    def closeEvent(self, event) -> None:
+        # Second pass: the dialog has had an event-loop turn to disappear.
+        if self._closing:
+            self._teardown()
+            super().closeEvent(event)
+            return
+
+        asked = self.project.is_dirty
+        if not self._confirm_discard():
+            event.ignore()
+            return
+
+        self._closing = True
+        if asked:
+            # Tearing this window down from inside the dialog's own call stack
+            # destroys both Wayland surfaces at once. Shell clients that track
+            # toplevels can still be holding the dialog's object when it goes,
+            # and referencing it gets them disconnected by the compositor — on
+            # this machine that reliably killed quickshell on every discard.
+            # That is a bug in the shell, not here, but a plain Qt app with a
+            # modal dialog reproduces it in twelve lines, so the cheapest cure
+            # is to stop provoking it: let the dialog be destroyed for real,
+            # then close.
+            event.ignore()
+            QTimer.singleShot(DIALOG_SETTLE_MS, self._finish_close)
+            return
+
+        self._teardown()
         super().closeEvent(event)
 
 
