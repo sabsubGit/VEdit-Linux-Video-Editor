@@ -42,6 +42,7 @@ VIDEO_TRACK_HEIGHT = 70
 AUDIO_TRACK_HEIGHT = 56
 TRACK_GAP = 2
 CLIP_RADIUS = 7           # corner rounding on clip rectangles
+NAME_BAND_HEIGHT = 21     # solid strip at the foot of a clip holding its name
 TRIM_GRAB_PX = 7          # how close to an edge counts as grabbing it
 SNAP_PX = 9               # snapping tolerance, in screen pixels
 MIN_PX_PER_FRAME = 0.002
@@ -359,9 +360,30 @@ class TimelineCanvas(QWidget):
     def _clip_colours(self, clip: Clip, selected: bool) -> tuple[QColor, QColor]:
         if clip.kind == "video":
             fill = theme.CLIP_VIDEO_SEL if selected else theme.CLIP_VIDEO
+            edge = theme.CLIP_VIDEO_EDGE
         else:
             fill = theme.CLIP_AUDIO_SEL if selected else theme.CLIP_AUDIO
-        return fill, theme.ACCENT if selected else theme.CLIP_BORDER
+            edge = theme.CLIP_AUDIO_EDGE
+        return fill, theme.CLIP_EDGE_SEL if selected else edge
+
+    @staticmethod
+    def _draw_link_icon(painter: QPainter, x: float, y: float, colour: QColor) -> None:
+        """The chain mark showing a clip is linked to its A/V partner.
+
+        Hand-drawn rather than a font glyph: at 11 pixels an emoji chain renders
+        differently on every system, and half of them are colour bitmaps that
+        ignore the pen entirely.
+        """
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        pen = QPen(colour, 1.4)
+        pen.setCapStyle(Qt.RoundCap)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        # Two interlocking links, overlapping so they read as a chain.
+        painter.drawRoundedRect(QRectF(x, y + 1.5, 7.0, 5.0), 2.5, 2.5)
+        painter.drawRoundedRect(QRectF(x + 4.5, y + 1.5, 7.0, 5.0), 2.5, 2.5)
+        painter.restore()
 
     def _paint_clips(self, painter: QPainter) -> None:
         selected = set(self.project.selected_ids)
@@ -407,34 +429,80 @@ class TimelineCanvas(QWidget):
                     fill = QColor(fill)
                     fill.setAlpha(190)
 
-                painter.setRenderHint(QPainter.Antialiasing, True)
-                painter.setPen(Qt.NoPen)
-                painter.setBrush(QBrush(fill))
-                painter.drawRoundedRect(rect, CLIP_RADIUS, CLIP_RADIUS)
-                painter.setRenderHint(QPainter.Antialiasing, False)
+                self._paint_clip_body(painter, clip, rect, fill, border, is_selected, metrics)
 
-                if clip.kind == "audio" and rect.width() > 4:
-                    self._paint_waveform(painter, clip, rect)
-                elif clip.kind == "video" and self.show_filmstrips and rect.width() > 6:
-                    self._paint_filmstrip(painter, clip, rect)
+    def _paint_clip_body(
+        self,
+        painter: QPainter,
+        clip: Clip,
+        rect: QRectF,
+        fill: QColor,
+        border: QColor,
+        is_selected: bool,
+        metrics: QFontMetrics,
+    ) -> None:
+        """Content on top, a solid name band along the foot, edge over both.
 
-                painter.setRenderHint(QPainter.Antialiasing, True)
-                painter.setPen(QPen(border, 2 if is_selected else 1))
-                painter.setBrush(Qt.NoBrush)
-                painter.drawRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), CLIP_RADIUS, CLIP_RADIUS)
-                painter.setRenderHint(QPainter.Antialiasing, False)
+        The name sits in its own band rather than floating over the picture: it
+        stays legible against any frame without needing a scrim, and it gives the
+        eye a consistent line to read a lane along.
+        """
+        # Content gets whatever is left above the band, so a short lane loses
+        # thumbnail height rather than losing the name.
+        band_height = min(NAME_BAND_HEIGHT, max(0.0, rect.height() - 8))
+        content = QRectF(rect)
+        content.setBottom(rect.bottom() - band_height)
 
-                if rect.width() > 34:
-                    label = metrics.elidedText(
-                        clip.name or "clip", Qt.ElideMiddle, int(rect.width()) - 10
-                    )
-                    if clip.kind == "video" and self.show_filmstrips:
-                        # Thumbnails are busy; the name needs its own backing or
-                        # it becomes unreadable over a bright frame.
-                        band = QRectF(rect.left(), rect.top(), rect.width(), 17)
-                        painter.fillRect(band, QColor(0, 0, 0, 130))
-                    painter.setPen(QColor(255, 255, 255, 235))
-                    painter.drawText(int(rect.left()) + 5, int(rect.top()) + 14, label)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(fill))
+        painter.drawRoundedRect(rect, CLIP_RADIUS, CLIP_RADIUS)
+        painter.setRenderHint(QPainter.Antialiasing, False)
+
+        if content.height() > 4 and rect.width() > 4:
+            if clip.kind == "audio":
+                self._paint_waveform(painter, clip, content)
+            elif self.show_filmstrips:
+                self._paint_filmstrip(painter, clip, content)
+
+        if band_height > 0:
+            # Clipping to the rounded body lets the band keep the bottom corners.
+            painter.save()
+            path = QPainterPath()
+            path.addRoundedRect(rect, CLIP_RADIUS, CLIP_RADIUS)
+            painter.setClipPath(path)
+            painter.fillRect(
+                QRectF(rect.left(), rect.bottom() - band_height, rect.width(), band_height),
+                fill,
+            )
+            painter.restore()
+
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(QPen(border, 2 if is_selected else 1))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), CLIP_RADIUS, CLIP_RADIUS)
+        painter.setRenderHint(QPainter.Antialiasing, False)
+
+        if band_height <= 0:
+            return
+
+        text_colour = QColor(255, 255, 255, 240)
+        cursor = rect.left() + 6.0
+        baseline = rect.bottom() - band_height / 2 + 4.0
+        available = rect.width() - 12.0
+
+        if clip.link_id is not None and available > 30:
+            self._draw_link_icon(painter, cursor, baseline - 10.0, text_colour)
+            cursor += 16.0
+            available -= 16.0
+
+        if available > 12:
+            painter.setPen(text_colour)
+            painter.drawText(
+                int(cursor),
+                int(baseline),
+                metrics.elidedText(clip.name or "clip", Qt.ElideMiddle, int(available)),
+            )
 
     def _paint_lane_change(self, painter: QPainter) -> None:
         """Draw clips that are being dragged onto a different lane."""
@@ -463,23 +531,12 @@ class TimelineCanvas(QWidget):
             if rect.width() < 1:
                 continue
 
-            fill, border = self._clip_colours(clip, True)
+            fill, _ = self._clip_colours(clip, True)
             fill = QColor(fill)
-            fill.setAlpha(190)
-
-            painter.setRenderHint(QPainter.Antialiasing, True)
-            painter.setPen(Qt.NoPen)
-            painter.setBrush(QBrush(fill))
-            painter.drawRoundedRect(rect, CLIP_RADIUS, CLIP_RADIUS)
-            painter.setPen(QPen(theme.ACCENT, 2))
-            painter.setBrush(Qt.NoBrush)
-            painter.drawRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), CLIP_RADIUS, CLIP_RADIUS)
-            painter.setRenderHint(QPainter.Antialiasing, False)
-
-            if rect.width() > 34:
-                label = metrics.elidedText(clip.name or "clip", Qt.ElideMiddle, int(rect.width()) - 10)
-                painter.setPen(QColor(255, 255, 255, 225))
-                painter.drawText(int(rect.left()) + 5, int(rect.top()) + 14, label)
+            fill.setAlpha(200)
+            self._paint_clip_body(
+                painter, clip, rect, fill, theme.CLIP_EDGE_SEL, True, metrics
+            )
 
     def _paint_filmstrip(self, painter: QPainter, clip: Clip, rect: QRectF) -> None:
         strip = self.filmstrips.get(clip.media_id, self.project.proxies.strip_for(clip.media_id))
@@ -528,7 +585,7 @@ class TimelineCanvas(QWidget):
         painter.setClipPath(path)
         draw_waveform(
             painter,
-            rect.adjusted(1, 15, -1, -3),
+            rect.adjusted(2, 2, -2, -1),
             peaks,
             src_in=clip.src_in,
             src_out=clip.src_out,

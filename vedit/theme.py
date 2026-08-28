@@ -23,11 +23,16 @@ ACCENT_DIM = QColor("#2b5f99")
 PLAYHEAD = QColor("#ff4a4a")
 
 CLIP_VIDEO = QColor("#3a6ea5")
-CLIP_VIDEO_SEL = QColor("#5b96d6")
+CLIP_VIDEO_SEL = QColor("#4a86c4")
 CLIP_AUDIO = QColor("#3d8a6b")
-CLIP_AUDIO_SEL = QColor("#5ab994")
+CLIP_AUDIO_SEL = QColor("#4aa383")
+# A lighter edge of the clip's own colour, rather than a dark outline: it reads
+# as one object and keeps clips distinct from each other where they abut.
+CLIP_VIDEO_EDGE = QColor("#7fb4e6")
+CLIP_AUDIO_EDGE = QColor("#7fd4b0")
+CLIP_EDGE_SEL = QColor("#ffffff")
 CLIP_BORDER = QColor("#0d0f12")
-WAVEFORM = QColor("#9fe3c6")
+WAVEFORM = QColor("#c9f0dd")
 
 OK = QColor("#5ac977")
 WARN = QColor("#e0a336")

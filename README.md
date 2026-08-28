@@ -16,8 +16,9 @@ Three pages, mirroring how the work splits up.
   peaks, filmstrips and preview proxies generate in the background.
 - **Edit** — preview viewer with a scrubber, and a timeline with three video and
   three audio lanes. Video clips show a filmstrip of frames and audio clips show
-  their waveform, so a lane can be read at a glance. Razor, trim, move, ripple
-  delete, clip speed, undo.
+  their waveform, with the clip name in a band along the foot and a chain mark on
+  anything still linked to its A/V partner. Razor, trim, move, ripple delete,
+  clip speed, undo.
 - **Render** — pick a preset and a destination, queue it, watch it go.
 
 ## Requirements
