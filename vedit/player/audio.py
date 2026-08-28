@@ -124,17 +124,45 @@ class _LaneReader:
     Hands back exactly as many samples as asked for, padding with silence for
     gaps and for sources that end early, so the mixer can add lanes together
     without worrying about which of them currently has content.
+
+    Position is counted in **samples**, never in frames. Counting frames means
+    rounding every decoded block to a whole frame: a 1024-sample AAC block is
+    0.64 frames at 30 fps, and rounding that to 1 makes the reader believe it is
+    1.56x further along than the audio it has actually produced. It then runs off
+    the end of the timeline early and the lane goes silent for the rest of
+    playback — on an 18-second timeline, after about 11 seconds.
     """
 
     def __init__(self, playlist: Playlist, timebase: TimeBase, start_frame: int) -> None:
         self.playlist = playlist
         self.timebase = timebase
-        self.position = start_frame
         self._pending = np.zeros(0, dtype=np.int16)
         self._container = None
         self._segment: Segment | None = None
         self._frames = None
         self._resampler = None
+        self._stream = None
+        self._seek_target = 0.0
+        self._sample_pos = self.samples_at(start_frame)
+
+    # -- position --------------------------------------------------------------
+
+    def samples_at(self, frame: int) -> int:
+        """Sample offset of a timeline frame."""
+        return int(round(float(self.timebase.frames_to_seconds(frame)) * SAMPLE_RATE))
+
+    @property
+    def elapsed_seconds(self) -> float:
+        return self._sample_pos / SAMPLE_RATE
+
+    @property
+    def position(self) -> int:
+        """Timeline frame this lane has produced audio up to."""
+        return int(self.elapsed_seconds * float(self.timebase.fps))
+
+    @property
+    def finished(self) -> bool:
+        return self._sample_pos >= self.samples_at(self.playlist.duration)
 
     def close(self) -> None:
         if self._container is not None:
@@ -159,12 +187,18 @@ class _LaneReader:
             take = min(wanted - filled, self._pending.size // CHANNELS)
             if take <= 0:
                 break
-            chunk = self._pending[: take * CHANNELS]
-            out[filled * CHANNELS : (filled + take) * CHANNELS] = chunk
+            out[filled * CHANNELS : (filled + take) * CHANNELS] = self._pending[: take * CHANNELS]
             self._pending = self._pending[take * CHANNELS :]
             filled += take
 
         return out
+
+    def _silence_to(self, frame: int) -> None:
+        """Queue silence up to a timeline frame, exactly."""
+        target = self.samples_at(frame)
+        count = max(0, target - self._sample_pos)
+        self._pending = np.zeros(count * CHANNELS, dtype=np.int16)
+        self._sample_pos = max(self._sample_pos, target)
 
     def _refill(self, stop: threading.Event) -> bool:
         """Decode more audio into `_pending`. False once the timeline runs out."""
@@ -174,24 +208,20 @@ class _LaneReader:
                 return False
 
             if segment.is_gap or segment.path is None:
-                remaining = segment.tl_end - self.position
-                samples = self._samples_for(remaining)
-                self._pending = np.zeros(samples * CHANNELS, dtype=np.int16)
-                self.position = segment.tl_end
+                self._silence_to(segment.tl_end)
                 self.close()
                 return True
 
             if self._segment is None or self._segment is not segment:
                 if not self._open(segment):
-                    self.position = segment.tl_end
-                    continue
+                    self._silence_to(segment.tl_end)
+                    return True
 
             block = self._next_block(segment)
             if block is None:
-                # Source ran dry before the segment did; pad the remainder.
-                remaining = max(0, segment.tl_end - self.position)
-                self._pending = np.zeros(self._samples_for(remaining) * CHANNELS, dtype=np.int16)
-                self.position = segment.tl_end
+                # Source ran dry before the segment did; pad the remainder so the
+                # lane stays aligned with the others.
+                self._silence_to(segment.tl_end)
                 self.close()
                 return True
 
@@ -199,8 +229,18 @@ class _LaneReader:
             return True
         return False
 
-    def _samples_for(self, frames: int) -> int:
-        return max(0, int(round(float(self.timebase.frames_to_seconds(frames)) * SAMPLE_RATE)))
+    # -- decoding --------------------------------------------------------------
+
+    def _source_seconds_now(self, segment: Segment) -> float:
+        """Exact source time for the current sample position.
+
+        Derived from samples rather than the floored frame, so a seek cannot
+        replay up to a frame of audio it has already emitted.
+        """
+        segment_start = float(self.timebase.frames_to_seconds(segment.tl_start))
+        into_segment = max(0.0, self.elapsed_seconds - segment_start)
+        source_start = float(self.timebase.frames_to_seconds(segment.src_start))
+        return source_start + into_segment * segment.speed
 
     def _open(self, segment: Segment) -> bool:
         self.close()
@@ -213,7 +253,7 @@ class _LaneReader:
             return False
 
         stream = container.streams.audio[0]
-        seconds = segment.source_seconds(self.position, self.timebase)
+        seconds = self._source_seconds_now(segment)
         try:
             container.seek(int(seconds / float(stream.time_base)), stream=stream, backward=True)
         except (av.error.FFmpegError, OSError):
@@ -256,8 +296,8 @@ class _LaneReader:
             if segment.speed != 1.0:
                 data = self._retime(data, segment.speed)
 
-            advance = data.size // CHANNELS
-            self.position += self.timebase.seconds_to_frames(advance / SAMPLE_RATE)
+            # Count exactly what was produced. Anything else drifts.
+            self._sample_pos += data.size // CHANNELS
             return data
 
     @staticmethod
@@ -293,8 +333,7 @@ class _LaneReader:
             return data
         out_pairs = max(1, int(pairs / speed))
         picks = np.minimum((np.arange(out_pairs) * speed).astype(np.int64), pairs - 1)
-        stereo = data.reshape(-1, CHANNELS)
-        return stereo[picks].reshape(-1)
+        return data.reshape(-1, CHANNELS)[picks].reshape(-1)
 
 
 class AudioStreamer:
@@ -444,7 +483,7 @@ class AudioStreamer:
                 mixed = np.zeros(block * CHANNELS, dtype=np.int32)
                 alive = False
                 for reader in readers:
-                    if reader.playlist.at(reader.position) is not None:
+                    if not reader.finished:
                         alive = True
                     mixed += reader.read(block, self._stop)
 

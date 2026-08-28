@@ -41,6 +41,9 @@ class PlaybackEngine(QObject):
         self._speed = 1.0
         self._position = 0
         self._stale = True
+        # True while the engine is announcing its own position, so following the
+        # playhead cannot turn into the engine chasing itself.
+        self._emitting = False
 
         # Tick a little faster than the frame rate so we never systematically
         # miss a presentation deadline by rounding.
@@ -122,6 +125,7 @@ class PlaybackEngine(QObject):
         self.pause() if self._playing else self.play()
 
     def seek(self, frame: int) -> None:
+        """Jump to a frame, continuing to play if we already were."""
         self._ensure_fresh()
         frame = max(0, int(frame))
         self._position = frame
@@ -131,7 +135,7 @@ class PlaybackEngine(QObject):
             self.audio.start(frame)
         else:
             self.audio.stop()
-        self.position_changed.emit(frame)
+        self._announce(frame)
 
     def step(self, frames: int) -> None:
         self.pause()
@@ -156,9 +160,24 @@ class PlaybackEngine(QObject):
         return self.clock.frame()
 
     def _on_playhead(self, frame: int) -> None:
-        """Follow the playhead when something else moves it, e.g. a scrub."""
-        if not self._playing and frame != self._position:
-            self.seek(frame)
+        """Follow the playhead whenever something *else* moves it.
+
+        This has to work during playback too: clicking the timeline mid-play
+        should jump there and carry on. Previously it was ignored while playing,
+        so the click set the playhead and the next tick immediately overwrote it
+        from the clock — the marker snapped back and playback continued from
+        where it had been.
+        """
+        if self._emitting or frame == self._position:
+            return
+        self.seek(frame)
+
+    def _announce(self, frame: int) -> None:
+        self._emitting = True
+        try:
+            self.position_changed.emit(frame)
+        finally:
+            self._emitting = False
 
     # -- the tick ---------------------------------------------------------------
 
@@ -173,12 +192,12 @@ class PlaybackEngine(QObject):
             duration = self.project.timeline.duration
             if target >= duration:
                 self._position = duration
-                self.position_changed.emit(self._position)
+                self._announce(self._position)
                 self.pause()
                 return
             if target != self._position:
                 self._position = target
-                self.position_changed.emit(target)
+                self._announce(target)
 
         decoded = self.video.frame_for(target)
         if decoded is None and not self._playing:

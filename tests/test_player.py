@@ -178,3 +178,66 @@ class TestBuildPlaylist:
         timeline = Timeline.default(TimeBase(30))
         playlist = build_playlist(timeline, None, None, None)
         assert not playlist
+
+
+class TestLaneReaderPosition:
+    """Guards the bug that silenced audio partway through playback.
+
+    Position was advanced by converting each decoded block to whole frames. A
+    1024-sample AAC block is 0.64 frames at 30fps, and rounding that to 1 made
+    the reader believe it was 1.56x further along than the audio it had actually
+    produced. It ran off the end of the timeline early and the lane went silent
+    for the rest of playback — on an 18-second timeline, after about 11 seconds.
+    """
+
+    def _reader(self, duration_frames=540, start=0):
+        from vedit.player.audio import _LaneReader
+
+        playlist = Playlist([Segment(0, duration_frames, None, 0)], duration_frames)
+        return _LaneReader(playlist, TimeBase(30), start)
+
+    def test_position_tracks_samples_not_rounded_frames(self):
+        reader = self._reader()
+        # Emit exactly one AAC block's worth: 0.64 frames, so still frame 0.
+        reader._sample_pos += 1024
+        assert reader.position == 0, "a partial frame must not count as a whole one"
+
+        # Twenty blocks is 20480 samples = 12.8 frames.
+        reader._sample_pos = 20480
+        assert reader.position == 12
+
+    def test_no_drift_over_a_long_timeline(self):
+        """The failure mode: after a full timeline's worth of blocks the reader
+        must be at the end, not far past it."""
+        reader = self._reader(duration_frames=540)      # 18 seconds
+        blocks = 0
+        while not reader.finished and blocks < 100_000:
+            reader._sample_pos += 1024
+            blocks += 1
+
+        produced_seconds = blocks * 1024 / 48000
+        assert produced_seconds == pytest.approx(18.0, abs=0.05), (
+            f"ran out after {produced_seconds:.1f}s of audio for an 18s timeline"
+        )
+
+    def test_finished_is_false_partway_through(self):
+        reader = self._reader(duration_frames=540)
+        reader._sample_pos = reader.samples_at(345)     # where it used to die
+        assert not reader.finished
+
+    def test_samples_at_matches_the_timebase(self):
+        reader = self._reader()
+        assert reader.samples_at(0) == 0
+        assert reader.samples_at(30) == 48000, "one second at 30fps"
+        assert reader.samples_at(540) == 48000 * 18
+
+    def test_silence_fills_exactly_to_a_frame(self):
+        reader = self._reader()
+        reader._silence_to(30)
+        assert reader._pending.size // 2 == 48000
+        assert reader.position == 30
+
+    def test_starting_partway_in(self):
+        reader = self._reader(start=150)
+        assert reader.position == 150
+        assert reader.elapsed_seconds == pytest.approx(5.0)
