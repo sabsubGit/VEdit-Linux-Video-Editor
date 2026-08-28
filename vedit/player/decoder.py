@@ -19,6 +19,7 @@ from pathlib import Path
 
 import av
 import av.error
+import numpy as np
 from PySide6.QtGui import QImage
 
 from vedit.core.timebase import TimeBase
@@ -39,8 +40,19 @@ def _to_qimage(frame) -> QImage:
     libswscale does the colour conversion in C, which at proxy resolution costs
     around a millisecond — far cheaper than doing it in Python, and simple enough
     that it needs no GL path.
+
+    swscale pads each row up to an alignment boundary, so for widths whose byte
+    length is not already aligned the result is **not** C-contiguous: a 484-wide
+    frame is 1452 bytes per row but is handed back with a stride of 1488. Wrapping
+    that buffer directly raises BufferError, which killed the decode thread and
+    left the viewer black while audio carried on playing. Common widths like 1920
+    and 1280 are already aligned, which is why this only shows up on unusual
+    sizes.
     """
     array = frame.to_ndarray(format="rgb24")
+    if not array.flags["C_CONTIGUOUS"]:
+        array = np.ascontiguousarray(array)
+
     height, width, _ = array.shape
     image = QImage(array.data, width, height, 3 * width, QImage.Format_RGB888)
     # The ndarray owns the buffer; copy so it can be freed independently of Qt.

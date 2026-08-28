@@ -8,6 +8,7 @@ frames never reached the screen.
 
 from __future__ import annotations
 
+import subprocess
 import time
 from fractions import Fraction
 
@@ -241,3 +242,83 @@ class TestLaneReaderPosition:
         reader = self._reader(start=150)
         assert reader.position == 150
         assert reader.elapsed_seconds == pytest.approx(5.0)
+
+
+class TestFrameConversion:
+    """Guards a bug that left the viewer black while audio played on.
+
+    swscale pads each output row up to an alignment boundary, so a frame whose
+    row length is not already aligned comes back non-contiguous — 484 pixels is
+    1452 bytes per row but arrives with a stride of 1488. Wrapping that buffer
+    directly raises BufferError, which killed the decode thread for the whole
+    session.
+
+    The widths below are not exotic: 854 is standard 480p widescreen and 1080 is
+    the width of any portrait phone video.
+    """
+
+    @staticmethod
+    def _make(path, width, height=240):
+        subprocess.run(
+            [
+                "ffmpeg", "-y", "-v", "error",
+                "-f", "lavfi", "-i", f"testsrc2=size={width}x{height}:rate=30",
+                "-t", "0.3", "-c:v", "libx264", "-preset", "ultrafast",
+                "-pix_fmt", "yuv420p", str(path),
+            ],
+            check=True,
+            capture_output=True,
+        )
+        return path
+
+    @pytest.mark.parametrize("width", [484, 486, 642, 854, 1080, 1234])
+    def test_unaligned_widths_convert(self, width, tmp_path):
+        import av
+
+        from vedit.player.decoder import _to_qimage
+
+        path = self._make(tmp_path / f"{width}.mp4", width)
+        container = av.open(str(path))
+        stream = container.streams.video[0]
+        try:
+            frame = next(container.decode(stream))
+            # Confirm the fixture really does exercise the padded path.
+            assert not frame.to_ndarray(format="rgb24").flags["C_CONTIGUOUS"]
+
+            image = _to_qimage(frame)
+            assert not image.isNull()
+            assert image.width() == width
+        finally:
+            container.close()
+
+    @pytest.mark.parametrize("width", [320, 640, 1280, 1920])
+    def test_aligned_widths_still_convert(self, width, tmp_path):
+        import av
+
+        from vedit.player.decoder import _to_qimage
+
+        path = self._make(tmp_path / f"{width}.mp4", width)
+        container = av.open(str(path))
+        try:
+            image = _to_qimage(next(container.decode(container.streams.video[0])))
+            assert not image.isNull()
+            assert image.width() == width
+        finally:
+            container.close()
+
+    def test_converted_image_survives_the_source_array(self, tmp_path):
+        """The QImage must own its pixels; it outlives the ndarray it came from."""
+        import gc
+
+        import av
+
+        from vedit.player.decoder import _to_qimage
+
+        path = self._make(tmp_path / "life.mp4", 484)
+        container = av.open(str(path))
+        try:
+            image = _to_qimage(next(container.decode(container.streams.video[0])))
+        finally:
+            container.close()
+        gc.collect()
+        assert image.pixelColor(10, 10).isValid()
