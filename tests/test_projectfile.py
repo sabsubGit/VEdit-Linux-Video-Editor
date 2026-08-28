@@ -16,6 +16,7 @@ from vedit.core.projectfile import (
     FORMAT_VERSION,
     ProjectFileError,
     load_project,
+    project_to_dict,
     save_project,
 )
 from vedit.core.timebase import TimeBase
@@ -170,3 +171,65 @@ class TestRejections:
         path.write_text(json.dumps({"format": "vedit-project", "version": 1}))
         result = load_project(path)
         assert [track.name for track in result.timeline.tracks] == ["V1", "V2", "V3", "A1", "A2", "A3"]
+
+
+class TestMixingFields:
+    def test_round_trip(self, project, tmp_path):
+        timeline, media = project
+        timeline.master_gain_db = -2.5
+        timeline.audio_tracks[1].gain_db = -6.0
+        timeline.audio_tracks[1].solo = True
+        clip = timeline.audio_tracks[0].clips[0]
+        clip.gain_db = 4.5
+        clip.fade_in = 12
+        clip.fade_out = 8
+
+        save_project(tmp_path / "mix.vedit", timeline, media)
+        loaded = load_project(tmp_path / "mix.vedit").timeline
+
+        assert loaded.master_gain_db == -2.5
+        assert loaded.audio_tracks[1].gain_db == -6.0
+        assert loaded.audio_tracks[1].solo is True
+        restored = loaded.audio_tracks[0].clips[0]
+        assert (restored.gain_db, restored.fade_in, restored.fade_out) == (4.5, 12, 8)
+
+    def test_the_written_version_is_two(self, project):
+        timeline, media = project
+        assert project_to_dict(timeline, media)["version"] == 2
+
+    def test_a_version_one_file_loads_with_everything_at_unity(self, project, tmp_path):
+        """Forward compatibility: the new fields all default to "as it was", so
+        a file written before they existed opens unchanged."""
+        timeline, media = project
+        payload = project_to_dict(timeline, media)
+        payload["version"] = 1
+        payload.pop("master_gain_db")
+        for track in payload["tracks"]:
+            track.pop("gain_db")
+            track.pop("solo")
+            for clip in track["clips"]:
+                clip.pop("gain_db")
+                clip.pop("fade_in")
+                clip.pop("fade_out")
+
+        path = tmp_path / "v1.vedit"
+        path.write_text(json.dumps(payload))
+        loaded = load_project(path).timeline
+
+        assert loaded.master_gain_db == 0.0
+        assert all(track.gain_db == 0.0 and not track.solo for track in loaded.tracks)
+        assert all(
+            clip.gain_db == 0.0 and not clip.has_fades for clip in loaded.all_clips()
+        )
+
+    def test_a_malformed_gain_drops_the_clip_not_the_project(self, project, tmp_path):
+        timeline, media = project
+        payload = project_to_dict(timeline, media)
+        payload["tracks"][3]["clips"][0]["gain_db"] = "loud"
+
+        path = tmp_path / "bad-gain.vedit"
+        path.write_text(json.dumps(payload))
+        loaded = load_project(path).timeline
+
+        assert len(loaded.audio_tracks[0].clips) == 0
+        assert len(loaded.video_tracks[0].clips) == 1, "the rest of the edit survives"

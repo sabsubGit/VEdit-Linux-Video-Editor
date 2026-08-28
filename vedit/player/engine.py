@@ -8,6 +8,11 @@ With no audio, a monotonic wall clock stands in.
 Nothing here decodes. The video decoder and audio streamer each run their own
 thread; this object only reads the clock, asks for the frame that belongs at that
 instant, and reports position.
+
+There is exactly one engine per window, shared by every page that shows a viewer.
+Two engines would mean two decoder threads and two audio devices contending for
+the same timeline, so the viewer is pointed at the engine rather than the other
+way round — see `set_surface`.
 """
 
 from __future__ import annotations
@@ -27,9 +32,16 @@ class PlaybackEngine(QObject):
     state_changed = Signal(bool)      # playing?
     error = Signal(str)
 
-    def __init__(self, project: Project, surface: VideoSurface, parent: QObject | None = None) -> None:
+    def __init__(
+        self,
+        project: Project,
+        surface: VideoSurface | None = None,
+        parent: QObject | None = None,
+    ) -> None:
         super().__init__(parent)
         self.project = project
+        # Starts without one: the window builds the engine before the pages that
+        # own the viewers, then points it at the first of them.
         self.surface = surface
 
         self.video = VideoDecoder(project.timebase)
@@ -57,6 +69,22 @@ class PlaybackEngine(QObject):
         project.timeline_changed.connect(self.invalidate)
         project.playhead_changed.connect(self._on_playhead)
 
+    # -- viewer -----------------------------------------------------------------
+
+    def set_surface(self, surface: VideoSurface | None) -> None:
+        """Point the engine at whichever page's viewer is on screen.
+
+        Switching pages mid-playback keeps playing: the sound is uninterrupted
+        and only the picture moves to the other widget.
+        """
+        if surface is self.surface:
+            return
+        self.surface = surface
+        # The new surface has whatever was last blitted to it, or nothing. Next
+        # tick fills it; clearing avoids a stale frame from a previous project.
+        if not self._playing:
+            self.video.seek(self._position)
+
     # -- playlist ---------------------------------------------------------------
 
     def invalidate(self) -> None:
@@ -78,6 +106,10 @@ class PlaybackEngine(QObject):
         self.audio.set_playlists(
             audio_playlists(timeline, pool, proxies), self._position
         )
+        # Fader positions live on the model; the mixer state is the copy the
+        # decode thread reads. Resyncing here keeps a fader drag that was never
+        # committed from surviving an undo.
+        self.audio.mixer.load(timeline)
         self._stale = False
 
     def _ensure_fresh(self) -> None:
@@ -104,13 +136,15 @@ class PlaybackEngine(QObject):
 
         self._speed = speed
         self._playing = True
-        self.clock.start(self._position, speed)
         # Audio only plays at normal speed; shuttling stays silent rather than
         # producing chipmunk artefacts.
         if abs(speed - 1.0) < 1e-6:
             self.audio.start(self._position)
         else:
             self.audio.stop()
+        # Started after the audio, because whether a device actually opened
+        # decides whether the clock should wait for it.
+        self.clock.start(self._position, speed, wait_for_audio=self.audio.active)
         self.state_changed.emit(True)
 
     def pause(self) -> None:
@@ -129,12 +163,14 @@ class PlaybackEngine(QObject):
         self._ensure_fresh()
         frame = max(0, int(frame))
         self._position = frame
-        self.clock.reset(frame)
         self.video.seek(frame)
         if self._playing and abs(self._speed - 1.0) < 1e-6:
             self.audio.start(frame)
         else:
             self.audio.stop()
+        # Same wait as on play: a seek restarts the device, so the clock would
+        # otherwise run ahead of it and be dragged back a few frames later.
+        self.clock.reset(frame, wait_for_audio=self.audio.active)
         self._announce(frame)
 
     def step(self, frames: int) -> None:
@@ -205,7 +241,7 @@ class PlaybackEngine(QObject):
             # match — an approximate frame beats a blank viewer during a scrub.
             decoded = self.video.frame_for(target + 2)
 
-        if decoded is not None:
+        if decoded is not None and self.surface is not None:
             if decoded.image.isNull():
                 self.surface.clear("")
             else:

@@ -11,7 +11,7 @@ from pathlib import Path
 import pytest
 
 from vedit.core.timebase import TimeBase
-from vedit.player.segments import audio_playlists, build_video_playlist
+from vedit.player.segments import audio_playlists, build_playlist, build_video_playlist
 from vedit.render.graph import _video_pieces
 from vedit.timeline.model import Clip, Timeline
 
@@ -156,3 +156,72 @@ class TestAudioLanes:
         lists = audio_playlists(timeline, FakePool(), FakeProxies())
         assert len(lists) == 1
         assert lists[0].segments[0].media_id == "b"
+
+
+class TestSegmentLevels:
+    """Segments carry the clip's level shape, so the audio thread never has to
+    look a clip up while it is decoding."""
+
+    def build(self, timeline, lane=0):
+        return build_playlist(
+            timeline, timeline.audio_tracks[lane], FakePool(), FakeProxies()
+        )
+
+    def test_playlist_knows_its_lane(self, timeline):
+        put(timeline, 1, "a", 0, 100, kind="audio")
+        playlist = self.build(timeline, lane=1)
+        assert playlist.track_id == timeline.audio_tracks[1].track_id
+
+    def test_gain_is_carried_as_a_linear_multiplier(self, timeline):
+        clip = put(timeline, 0, "a", 0, 100, kind="audio")
+        clip.gain_db = -6.0
+        segment = self.build(timeline).at(0)
+        assert segment.gain == pytest.approx(0.501187, abs=1e-5)
+        assert segment.clip_id == clip.clip_id
+
+    def test_fades_are_carried_in_frames(self, timeline):
+        clip = put(timeline, 0, "a", 0, 100, kind="audio")
+        clip.fade_in, clip.fade_out = 12, 8
+        segment = self.build(timeline).at(0)
+        assert (segment.fade_in, segment.fade_out) == (12, 8)
+
+    def test_gaps_stay_at_unity(self, timeline):
+        clip = put(timeline, 0, "a", 50, 100, kind="audio")
+        clip.gain_db = -12.0
+        gap = self.build(timeline).at(0)
+        assert gap.is_gap
+        assert gap.gain == 1.0 and gap.fade_in == 0
+
+    def test_video_segments_never_carry_levels(self, timeline):
+        clip = put(timeline, 0, "v", 0, 100)
+        clip.gain_db = 6.0
+        clip.fade_in = 10
+        segment = build_video_playlist(timeline, FakePool(), FakeProxies()).at(0)
+        assert segment.gain == 1.0 and segment.fade_in == 0
+
+    def test_two_clips_of_one_source_are_not_merged(self, timeline):
+        """They may carry different gain, so `clip_id` keeps them apart even
+        though the file, speed and source offsets line up."""
+        first = put(timeline, 0, "a", 0, 100)
+        put(timeline, 0, "a", 100, 100, src_in=100)
+        first.gain_db = -6.0
+        playlist = build_video_playlist(timeline, FakePool(), FakeProxies())
+        assert len(playlist.segments) == 2
+
+
+class TestSoloInPreview:
+    def test_solo_silences_the_other_lanes(self, timeline):
+        put(timeline, 0, "a", 0, 100, kind="audio")
+        put(timeline, 1, "b", 0, 100, kind="audio")
+        timeline.audio_tracks[1].solo = True
+        lists = audio_playlists(timeline, FakePool(), FakeProxies())
+        assert len(lists) == 1
+        assert lists[0].segments[0].media_id == "b"
+
+    def test_a_muted_and_soloed_lane_stays_silent(self, timeline):
+        put(timeline, 0, "a", 0, 100, kind="audio")
+        put(timeline, 1, "b", 0, 100, kind="audio")
+        timeline.audio_tracks[0].muted = True
+        timeline.audio_tracks[0].solo = True
+        lists = audio_playlists(timeline, FakePool(), FakeProxies())
+        assert [p.segments[0].media_id for p in lists] == ["b"]

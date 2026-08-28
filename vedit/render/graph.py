@@ -9,6 +9,18 @@ concatenated. Normalising scale and frame rate *per segment before* the concat i
 what lets clips of different sizes and rates cut together, which is a common
 failure elsewhere — `concat` requires every input to agree, and silently produces
 garbage timing if they do not.
+
+Levels are applied at the same three points as the preview mixer, in the same
+order: clip gain and fades per piece, lane gain after the lane concat, master
+gain after the mix. Every clause is emitted only when it is not a no-op, so a
+timeline nobody has mixed produces exactly the command it did before any of this
+existed.
+
+One known divergence, documented rather than fixed: the preview clips at int16
+after the master fader, and ffmpeg's float pipeline does not clip until encode,
+so a mix that distorts in preview renders slightly cleaner. An `alimiter` would
+close the gap by making the export *quieter* than what was monitored, which is
+the worse surprise of the two.
 """
 
 from __future__ import annotations
@@ -20,6 +32,7 @@ from pathlib import Path
 from vedit.core.ffmpeg import ffmpeg_path
 from vedit.media.pool import MediaPool
 from vedit.render.presets import Preset
+from vedit.timeline.levels import from_db
 from vedit.timeline.model import Timeline, Track
 
 
@@ -36,6 +49,9 @@ class Piece:
     end: float
     duration: float              # length on the timeline, after any speed change
     speed: float = 1.0
+    gain: float = 1.0            # linear, from the clip's gain_db
+    fade_in: float = 0.0         # seconds
+    fade_out: float = 0.0
 
 
 def _gap(timeline: Timeline, from_frame: int, to_frame: int) -> Piece:
@@ -43,11 +59,34 @@ def _gap(timeline: Timeline, from_frame: int, to_frame: int) -> Piece:
 
 
 def _piece_for(clip, timeline: Timeline, inputs: dict[str, int], start: int, end: int) -> Piece:
-    """One clip span as a render piece, in source seconds."""
+    """One clip span as a render piece, in source seconds.
+
+    Fades are carried only when the piece covers the clip's own edge. A razored
+    clip's right-hand half must not restart its fade in, and video pieces never
+    carry levels at all.
+    """
     source_start = timeline.seconds(clip.source_frame_at(start))
     source_end = timeline.seconds(clip.source_frame_at(end))
     played = timeline.seconds(end) - timeline.seconds(start)
-    return Piece(inputs[clip.media_id], source_start, source_end, played, clip.speed)
+
+    gain, fade_in, fade_out = 1.0, 0.0, 0.0
+    if clip.kind == "audio":
+        gain = from_db(clip.gain_db)
+        if clip.fade_in and start <= clip.tl_start:
+            fade_in = min(timeline.seconds(clip.fade_in), played)
+        if clip.fade_out and end >= clip.tl_end:
+            fade_out = min(timeline.seconds(clip.fade_out), played)
+
+    return Piece(
+        inputs[clip.media_id],
+        source_start,
+        source_end,
+        played,
+        clip.speed,
+        gain,
+        fade_in,
+        fade_out,
+    )
 
 
 def _video_pieces(timeline: Timeline, inputs: dict[str, int], pool: MediaPool) -> list[Piece]:
@@ -80,6 +119,27 @@ def _video_pieces(timeline: Timeline, inputs: dict[str, int], pool: MediaPool) -
         else:
             pieces.append(_piece_for(winner, timeline, inputs, start, end))
     return pieces
+
+
+def _shaping(piece: Piece) -> str:
+    """The clip's own level clauses, appended to its filter chain.
+
+    `afade`'s default curve is `tri`, which is a linear ramp — the same shape the
+    preview's `envelope()` applies, so the two agree. `st` is relative to the
+    piece's own zero, which the preceding `asetpts=PTS-STARTPTS` guarantees.
+
+    Empty when there is nothing to apply, so an unmixed timeline's command stays
+    byte-identical to what it was before mixing existed.
+    """
+    clauses = ""
+    if piece.gain != 1.0:
+        clauses += f",volume={piece.gain:.6f}"
+    if piece.fade_in > 0.0:
+        clauses += f",afade=t=in:st=0:d={piece.fade_in:.6f}"
+    if piece.fade_out > 0.0:
+        start = max(0.0, piece.duration - piece.fade_out)
+        clauses += f",afade=t=out:st={start:.6f}:d={piece.fade_out:.6f}"
+    return clauses
 
 
 def _audio_pieces(track: Track, timeline: Timeline, inputs: dict[str, int], pool: MediaPool) -> list[Piece]:
@@ -133,10 +193,13 @@ def build_command(
     fps: Fraction = timeline.timebase.fps
 
     video_pieces = _video_pieces(timeline, inputs, pool)
+    # `audible_audio_tracks` rather than a local mute test: it is the one
+    # definition of what is heard, so solo means the same thing in the exported
+    # file as it does on the Audio page.
     audio_lanes = [
-        _audio_pieces(track, timeline, inputs, pool)
-        for track in timeline.audio_tracks
-        if not track.muted and track.clips
+        (track, _audio_pieces(track, timeline, inputs, pool))
+        for track in timeline.audible_audio_tracks()
+        if track.clips
     ]
 
     filters: list[str] = []
@@ -171,7 +234,7 @@ def build_command(
         video_labels.append(f"[{label}]")
 
     lane_outputs: list[str] = []
-    for lane_index, pieces in enumerate(audio_lanes):
+    for lane_index, (track, pieces) in enumerate(audio_lanes):
         labels: list[str] = []
         for index, piece in enumerate(pieces):
             label = f"a{lane_index}_{index}"
@@ -196,12 +259,18 @@ def build_command(
                     f"{retime}"
                     f"aresample={preset.sample_rate},"
                     f"aformat=sample_fmts=fltp:channel_layouts=stereo"
+                    f"{_shaping(piece)}"
                     f"[{label}]"
                 )
             labels.append(f"[{label}]")
 
         lane_label = f"alane{lane_index}"
         filters.append("".join(labels) + f"concat=n={len(labels)}:v=0:a=1[{lane_label}]")
+
+        lane_gain = from_db(track.gain_db)
+        if lane_gain != 1.0:
+            filters.append(f"[{lane_label}]volume={lane_gain:.6f}[{lane_label}g]")
+            lane_label = f"{lane_label}g"
         lane_outputs.append(f"[{lane_label}]")
 
     # concat needs at least one segment on each stream it is told to produce.
@@ -212,23 +281,31 @@ def build_command(
     # between real audio clips still become silence — but a wholly silent track
     # would just be dead weight in the file.
     has_audio = any(
-        piece.input_index is not None for pieces in audio_lanes for piece in pieces
+        piece.input_index is not None for _, pieces in audio_lanes for piece in pieces
     )
 
     filters.append(
         "".join(video_labels) + f"concat=n={len(video_labels)}:v=1:a=0[vout]"
     )
     if has_audio:
+        master = from_db(timeline.master_gain_db)
+        # The mix lands on [aout] directly unless there is a master fader to
+        # apply, so a timeline at unity produces the command it always did.
+        mix_label = "aout_pre" if master != 1.0 else "aout"
         if len(lane_outputs) == 1:
-            filters.append(f"{lane_outputs[0]}anull[aout]")
+            filters.append(f"{lane_outputs[0]}anull[{mix_label}]")
         else:
             # dropout_transition=0 stops amix from ducking the mix when one lane
             # falls silent, which would audibly pump the others.
             filters.append(
                 "".join(lane_outputs)
                 + f"amix=inputs={len(lane_outputs)}:duration=longest"
-                f":dropout_transition=0:normalize=0[aout]"
+                f":dropout_transition=0:normalize=0[{mix_label}]"
             )
+        if master != 1.0:
+            # After the mix, exactly where the preview applies it — so what was
+            # heard on the Audio page is what lands in the file.
+            filters.append(f"[{mix_label}]volume={master:.6f}[aout]")
 
     args = [ffmpeg_path(), "-hide_banner", "-nostdin", "-y"]
     args += input_args

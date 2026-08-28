@@ -509,3 +509,216 @@ class TestUndo:
         for frame in range(10, 90, 10):
             stack.apply("razor", lambda t, f=frame: ops.razor(t, f))
         assert len(stack._done) == 5
+
+
+class TestGainAndFades:
+    def test_gain_defaults_to_unity(self):
+        clip = make_clip()
+        assert clip.gain_db == 0.0
+        assert clip.fade_in == 0 and clip.fade_out == 0
+        assert not clip.has_fades
+
+    def test_gain_outside_the_range_is_rejected(self):
+        with pytest.raises(TimelineError, match="gain"):
+            Clip(media_id="m", src_in=0, src_out=10, tl_start=0, src_length=10, gain_db=24.0)
+        with pytest.raises(TimelineError, match="gain"):
+            Clip(media_id="m", src_in=0, src_out=10, tl_start=0, src_length=10, gain_db=-90.0)
+
+    def test_a_fade_longer_than_the_clip_clamps(self):
+        clip = make_clip(length=100)
+        clip.fade_in = 500
+        clip.clamp_fades()
+        assert clip.fade_in == 100
+
+    def test_fades_cannot_together_exceed_the_clip_and_the_in_wins(self):
+        clip = make_clip(length=100)
+        clip.fade_in = 80
+        clip.fade_out = 80
+        clip.clamp_fades()
+        assert clip.fade_in == 80
+        assert clip.fade_out == 20
+
+    def test_negative_fades_clamp_to_zero(self):
+        clip = make_clip(length=100)
+        clip.fade_in = -5
+        clip.clamp_fades()
+        assert clip.fade_in == 0
+
+    def test_construction_clamps_rather_than_raising(self):
+        """A fade is a dragged value, so it is clamped; a gain is typed, so it raises."""
+        clip = Clip(
+            media_id="m", src_in=0, src_out=10, tl_start=0, src_length=10, fade_in=99
+        )
+        assert clip.fade_in == 10
+
+    def test_clip_copy_preserves_gain_and_fades(self):
+        clip = make_clip(length=100)
+        clip.gain_db = -4.5
+        clip.fade_in = 12
+        clip.fade_out = 8
+        twin = clip.copy()
+        assert (twin.gain_db, twin.fade_in, twin.fade_out) == (-4.5, 12, 8)
+
+    def test_track_copy_preserves_gain_and_solo(self):
+        """The regression guard for the snapshot bug: a hand-written `copy` that
+        forgot these would make every undo silently reset the mixer."""
+        track = Track(kind="audio", name="A1", gain_db=-6.0, solo=True)
+        twin = track.copy()
+        assert twin.gain_db == -6.0
+        assert twin.solo is True
+        assert twin.track_id == track.track_id
+
+    def test_snapshot_round_trips_master_gain(self, timeline):
+        timeline.master_gain_db = -2.5
+        state = timeline.snapshot()
+        timeline.master_gain_db = 6.0
+        timeline.restore(state)
+        assert timeline.master_gain_db == -2.5
+
+    def test_restore_still_accepts_a_bare_track_list(self, timeline):
+        tracks = [track.copy() for track in timeline.tracks]
+        timeline.restore(tracks)
+        assert len(timeline.tracks) == len(tracks)
+
+    def test_trim_reclamps_fades(self, timeline):
+        """Shortening a clip past its own fade would otherwise leave a fade
+        longer than the clip, and the playback envelope goes negative."""
+        track = timeline.audio_tracks[0]
+        clip = make_clip(length=100, kind="audio", src_length=200)
+        track.insert(clip)
+        clip.fade_out = 60
+        ops.trim(timeline, clip, "out", 30)
+        assert clip.duration == 30
+        assert clip.fade_out <= clip.duration
+
+
+class TestAudibility:
+    def test_no_solo_means_every_unmuted_lane(self, timeline):
+        assert timeline.audible_audio_tracks() == timeline.audio_tracks
+
+    def test_a_muted_lane_drops_out(self, timeline):
+        timeline.audio_tracks[1].muted = True
+        audible = timeline.audible_audio_tracks()
+        assert timeline.audio_tracks[1] not in audible
+        assert len(audible) == 2
+
+    def test_one_solo_silences_the_others(self, timeline):
+        timeline.audio_tracks[2].solo = True
+        assert timeline.audible_audio_tracks() == [timeline.audio_tracks[2]]
+
+    def test_solo_is_additive(self, timeline):
+        timeline.audio_tracks[0].solo = True
+        timeline.audio_tracks[2].solo = True
+        assert timeline.audible_audio_tracks() == [
+            timeline.audio_tracks[0],
+            timeline.audio_tracks[2],
+        ]
+
+    def test_solo_does_not_resurrect_a_muted_lane(self, timeline):
+        """A stale solo must not un-kill something deliberately muted."""
+        timeline.audio_tracks[0].muted = True
+        timeline.audio_tracks[0].solo = True
+        assert timeline.audible_audio_tracks() == timeline.audio_tracks[1:]
+
+    def test_soloing_only_a_muted_lane_leaves_the_rest_audible(self, timeline):
+        timeline.audio_tracks[0].muted = True
+        timeline.audio_tracks[0].solo = True
+        assert timeline.audio_tracks[1] in timeline.audible_audio_tracks()
+
+    def test_video_lanes_are_never_returned(self, timeline):
+        assert all(t.kind == "audio" for t in timeline.audible_audio_tracks())
+
+
+class TestLevelOps:
+    @pytest.fixture
+    def audio_clip(self, timeline):
+        clip = make_clip(length=100, kind="audio", src_length=200)
+        timeline.audio_tracks[0].insert(clip)
+        return clip
+
+    def test_set_clip_gain_clamps(self, timeline, audio_clip):
+        ops.set_clip_gain(timeline, [audio_clip], 99.0)
+        assert audio_clip.gain_db == 12.0
+        ops.set_clip_gain(timeline, [audio_clip], -99.0)
+        assert audio_clip.gain_db == -60.0
+
+    def test_set_clip_gain_skips_video_in_a_mixed_selection(self, timeline, audio_clip):
+        video = make_clip(length=100, kind="video")
+        timeline.video_tracks[0].insert(video)
+        touched = ops.set_clip_gain(timeline, [video, audio_clip], -6.0)
+        assert touched == [audio_clip]
+        assert audio_clip.gain_db == -6.0
+        assert video.gain_db == 0.0
+
+    def test_set_clip_gain_refuses_a_locked_lane(self, timeline, audio_clip):
+        timeline.audio_tracks[0].locked = True
+        with pytest.raises(TimelineError, match="locked"):
+            ops.set_clip_gain(timeline, [audio_clip], -6.0)
+
+    def test_set_clip_fade_clamps_against_the_other_fade(self, timeline, audio_clip):
+        ops.set_clip_fade(timeline, audio_clip, "in", 70)
+        set_to = ops.set_clip_fade(timeline, audio_clip, "out", 70)
+        assert set_to == 30
+        assert audio_clip.fade_in + audio_clip.fade_out == 100
+
+    def test_set_clip_fade_clamps_to_the_clip(self, timeline, audio_clip):
+        assert ops.set_clip_fade(timeline, audio_clip, "in", 500) == 100
+
+    def test_set_clip_fade_ignores_video(self, timeline):
+        video = make_clip(length=100, kind="video")
+        timeline.video_tracks[0].insert(video)
+        assert ops.set_clip_fade(timeline, video, "in", 10) == 0
+        assert video.fade_in == 0
+
+    def test_clear_clip_fades(self, timeline, audio_clip):
+        audio_clip.fade_in, audio_clip.fade_out = 10, 20
+        ops.clear_clip_fades(timeline, [audio_clip])
+        assert not audio_clip.has_fades
+
+    def test_normalise_applies_the_measured_gain(self, timeline, audio_clip):
+        ops.normalise_clips(timeline, [audio_clip], {audio_clip.clip_id: 4.5})
+        assert audio_clip.gain_db == 4.5
+
+    def test_normalise_skips_clips_with_no_measurement(self, timeline, audio_clip):
+        assert ops.normalise_clips(timeline, [audio_clip], {}) == []
+        assert audio_clip.gain_db == 0.0
+
+    def test_track_gain_and_master_clamp(self, timeline):
+        assert ops.set_track_gain(timeline, timeline.audio_tracks[0], 99.0) == 12.0
+        assert ops.set_master_gain(timeline, -99.0) == -60.0
+        assert timeline.master_gain_db == -60.0
+
+    def test_track_gain_works_on_a_locked_lane(self, timeline):
+        """Locking protects the edit, not the monitoring level."""
+        track = timeline.audio_tracks[0]
+        track.locked = True
+        ops.set_track_gain(timeline, track, -6.0)
+        assert track.gain_db == -6.0
+
+    def test_clear_solos(self, timeline):
+        for track in timeline.audio_tracks:
+            track.solo = True
+        ops.clear_solos(timeline)
+        assert not any(track.solo for track in timeline.audio_tracks)
+
+    def test_gain_is_undoable_as_one_step(self, timeline, audio_clip):
+        undo = UndoStack(timeline)
+        undo.apply("Clip gain", lambda tl: ops.set_clip_gain(tl, [audio_clip], -9.0))
+        assert timeline.audio_tracks[0].clips[0].gain_db == -9.0
+        undo.undo()
+        assert timeline.audio_tracks[0].clips[0].gain_db == 0.0
+
+    def test_master_gain_is_undoable(self, timeline):
+        undo = UndoStack(timeline)
+        undo.apply("Master gain", lambda tl: ops.set_master_gain(tl, -4.0))
+        assert timeline.master_gain_db == -4.0
+        undo.undo()
+        assert timeline.master_gain_db == 0.0
+
+    def test_solo_is_undoable(self, timeline):
+        undo = UndoStack(timeline)
+        track = timeline.audio_tracks[1]
+        undo.apply("Solo", lambda tl: ops.set_track_solo(tl, track, True))
+        assert timeline.audio_tracks[1].solo
+        undo.undo()
+        assert not timeline.audio_tracks[1].solo

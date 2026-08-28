@@ -15,7 +15,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum, auto
 
-from PySide6.QtCore import QPoint, QRectF, Qt, Signal
+from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
@@ -31,8 +31,16 @@ from PySide6.QtWidgets import QHBoxLayout, QMenu, QScrollBar, QVBoxLayout, QWidg
 from vedit import theme
 from vedit.core.project import Project
 from vedit.media.pool import MediaPool
-from vedit.timeline import ops
-from vedit.timeline.model import Clip, Timeline, TimelineError, Track
+from vedit.timeline import levels, ops
+from vedit.timeline.model import (
+    MAX_GAIN_DB,
+    MIN_GAIN_DB,
+    Clip,
+    Timeline,
+    TimelineError,
+    Track,
+    TrackKind,
+)
 from vedit.timeline.filmstrip import FilmstripCache, draw_filmstrip
 from vedit.timeline.waveform import WaveformCache, draw_waveform
 
@@ -40,10 +48,20 @@ RULER_HEIGHT = 26
 HEADER_WIDTH = 108
 VIDEO_TRACK_HEIGHT = 70
 AUDIO_TRACK_HEIGHT = 56
+# The Audio page's lanes. Twice the height is what makes a waveform something
+# you can edit against rather than a decoration, and it is what gives the fade
+# handles room to be distinct from the trim handles.
+AUDIO_TRACK_HEIGHT_TALL = 112
 TRACK_GAP = 2
 CLIP_RADIUS = 7           # corner rounding on clip rectangles
 NAME_BAND_HEIGHT = 21     # solid strip at the foot of a clip holding its name
 TRIM_GRAB_PX = 7          # how close to an edge counts as grabbing it
+FADE_GRAB_PX = 13         # height of the corner square that takes a fade drag
+FADE_HANDLE_PX = 15       # how far in from the edge that square reaches
+GAIN_GRAB_PX = 5          # vertical tolerance on the volume line
+# Peak target for Normalise. -3 dBFS rather than 0: it leaves headroom for the
+# lane and master faders to add to without the sum clipping immediately.
+NORMALISE_TARGET_DB = -3.0
 SNAP_PX = 9               # snapping tolerance, in screen pixels
 MIN_PX_PER_FRAME = 0.002
 MAX_PX_PER_FRAME = 40.0
@@ -53,6 +71,9 @@ class Zone(Enum):
     BODY = auto()
     IN = auto()
     OUT = auto()
+    FADE_IN = auto()
+    FADE_OUT = auto()
+    GAIN = auto()
 
 
 @dataclass(slots=True)
@@ -67,6 +88,8 @@ class Mode(Enum):
     SCRUB = auto()
     MOVE = auto()
     TRIM = auto()
+    FADE = auto()
+    GAIN = auto()
 
 
 class TimelineCanvas(QWidget):
@@ -76,12 +99,38 @@ class TimelineCanvas(QWidget):
     zoom_changed = Signal()
     status_message = Signal(str)
 
-    def __init__(self, project: Project, parent=None) -> None:
+    def __init__(
+        self,
+        project: Project,
+        parent=None,
+        *,
+        kinds: tuple[TrackKind, ...] = ("video", "audio"),
+        track_heights: dict[str, int] | None = None,
+        fade_handles: bool = False,
+        volume_lines: bool = False,
+    ) -> None:
+        """A canvas over some or all of the timeline's lanes.
+
+        Parameterised rather than subclassed. `track_rows()` is the one place
+        the lane set is decided and everything else — hit testing, painting,
+        scrolling, drops — derives from it, so a `kinds` filter carries almost
+        the whole audio-only view on its own. The feature flags are separate
+        from the filter because they compose: fade handles on the Edit page
+        would be a flag change, not a new class.
+        """
         super().__init__(parent)
         self.project = project
         self.waveforms = WaveformCache()
         self.filmstrips = FilmstripCache()
         self.show_filmstrips = True
+
+        self.kinds = kinds
+        self.track_heights = track_heights or {
+            "video": VIDEO_TRACK_HEIGHT,
+            "audio": AUDIO_TRACK_HEIGHT,
+        }
+        self.fade_handles = fade_handles
+        self.volume_lines = volume_lines
 
         self.px_per_frame = 2.0
         self.scroll_x = 0.0
@@ -90,7 +139,9 @@ class TimelineCanvas(QWidget):
         self.setFocusPolicy(Qt.StrongFocus)
         self.setMouseTracking(True)
         self.setAcceptDrops(True)
-        self.setMinimumHeight(RULER_HEIGHT + VIDEO_TRACK_HEIGHT + AUDIO_TRACK_HEIGHT + 24)
+        self.setMinimumHeight(
+            RULER_HEIGHT + sum(self.track_heights[kind] for kind in self.kinds) + 24
+        )
 
         self._mode = Mode.IDLE
         self._press_pos = QPoint()
@@ -103,6 +154,11 @@ class TimelineCanvas(QWidget):
         self._trim_clip: Clip | None = None
         self._trim_edge: str = "out"
         self._trim_frame = 0
+        self._level_clip: Clip | None = None      # the clip a gain or fade drag holds
+        self._fade_edge: str = "in"
+        self._fade_frames = 0
+        self._gain_db = 0.0
+        self._gain_press_db = 0.0
         self._drop_frame: int | None = None
         self._snap_line: int | None = None
         # Armed so a brand-new window fits itself once it has real geometry.
@@ -145,31 +201,36 @@ class TimelineCanvas(QWidget):
 
     # -- track geometry --------------------------------------------------------
 
-    def track_rows(self) -> list[tuple[Track, int, int]]:
-        """(track, y, height) top to bottom: video lanes above audio lanes.
+    def lanes(self) -> list[Track]:
+        """The lanes shown here, in the order they are drawn.
 
         Video is listed in reverse so V1 sits closest to the audio lanes and
         higher-numbered tracks stack upward, which is the layout every NLE uses.
+        The Audio page passes kinds=("audio",) and gets the audio half of the
+        same layout with nothing else to change.
         """
+        rows: list[Track] = []
+        if "video" in self.kinds:
+            rows += list(reversed(self.timeline.video_tracks))
+        if "audio" in self.kinds:
+            rows += self.timeline.audio_tracks
+        return rows
+
+    def track_rows(self) -> list[tuple[Track, int, int]]:
+        """(track, y, height) top to bottom."""
         rows: list[tuple[Track, int, int]] = []
         y = RULER_HEIGHT + TRACK_GAP - int(self.scroll_y)
-        for track in reversed(self.timeline.video_tracks):
-            rows.append((track, y, VIDEO_TRACK_HEIGHT))
-            y += VIDEO_TRACK_HEIGHT + TRACK_GAP
-        for track in self.timeline.audio_tracks:
-            rows.append((track, y, AUDIO_TRACK_HEIGHT))
-            y += AUDIO_TRACK_HEIGHT + TRACK_GAP
+        for track in self.lanes():
+            height = self.track_heights[track.kind]
+            rows.append((track, y, height))
+            y += height + TRACK_GAP
         return rows
 
     def lanes_height(self) -> int:
         """Total height every lane needs, ignoring how much is on screen."""
-        videos = len(self.timeline.video_tracks)
-        audios = len(self.timeline.audio_tracks)
-        return (
-            videos * (VIDEO_TRACK_HEIGHT + TRACK_GAP)
-            + audios * (AUDIO_TRACK_HEIGHT + TRACK_GAP)
-            + TRACK_GAP
-        )
+        return sum(
+            self.track_heights[track.kind] + TRACK_GAP for track in self.lanes()
+        ) + TRACK_GAP
 
     def max_scroll_y(self) -> int:
         return max(0, self.lanes_height() - (self.height() - RULER_HEIGHT))
@@ -199,6 +260,51 @@ class TimelineCanvas(QWidget):
         right = round(self.x_of(clip.tl_end))
         return QRectF(left, top + 1, max(right - left, 1.0), height - 2)
 
+    def row_for(self, clip: Clip) -> tuple[int, int] | None:
+        """(top, height) of the lane a clip is on, if that lane is shown here."""
+        for track, top, height in self.track_rows():
+            if track.clip_by_id(clip.clip_id) is not None:
+                return top, height
+        return None
+
+    # -- clip levels -----------------------------------------------------------
+
+    def _gain_band(self, rect: QRectF) -> QRectF:
+        """The vertical span the volume line moves in: the clip above its name band."""
+        band = min(NAME_BAND_HEIGHT, max(0.0, rect.height() - 8))
+        return QRectF(rect.left(), rect.top() + 2, rect.width(), max(1.0, rect.height() - band - 4))
+
+    def _gain_y(self, gain_db: float, rect: QRectF) -> float:
+        """Screen y for a gain, through the same curve as the mixer fader.
+
+        Sharing `db_to_fraction` is what makes a clip at unity and a fader at
+        unity sit at the same proportional height — the two would otherwise
+        disagree about what 0 dB looks like.
+        """
+        band = self._gain_band(rect)
+        return band.bottom() - levels.db_to_fraction(gain_db) * band.height()
+
+    def _gain_db_at(self, y: float, rect: QRectF) -> float:
+        band = self._gain_band(rect)
+        fraction = (band.bottom() - y) / max(1.0, band.height())
+        return levels.fraction_to_db(fraction)
+
+    def _fades_grabbable(self, clip: Clip, rect: QRectF) -> bool:
+        """Whether this clip is big enough to offer fade handles.
+
+        The handles live in a square at each top corner, where the trim handle
+        already runs the clip's full height. Below these sizes that square would
+        swallow most of the trim target, so they are simply not offered — which
+        is why the Edit page's short lanes keep behaving exactly as they do now
+        and only the Audio page's tall ones grow handles.
+        """
+        return (
+            self.fade_handles
+            and clip.kind == "audio"
+            and rect.height() >= FADE_GRAB_PX * 4
+            and rect.width() >= FADE_HANDLE_PX * 3
+        )
+
     # -- hit testing -----------------------------------------------------------
 
     def hit_test(self, pos: QPoint) -> Hit | None:
@@ -213,6 +319,18 @@ class TimelineCanvas(QWidget):
             rect = self.clip_rect(clip, top, height)
             if not (rect.left() <= pos.x() <= rect.right()):
                 continue
+
+            # Precedence: fade corner, then trim edge, then volume line, then
+            # body. Fade and trim are kept apart by geometry rather than by a
+            # modifier — the fade handle owns a small square at the top corner
+            # and the trim handle keeps the rest of the edge's height, which on
+            # a tall lane is the large majority of it.
+            if self._fades_grabbable(clip, rect) and pos.y() - rect.top() <= FADE_GRAB_PX:
+                if pos.x() - rect.left() <= FADE_HANDLE_PX:
+                    return Hit(track, clip, Zone.FADE_IN)
+                if rect.right() - pos.x() <= FADE_HANDLE_PX:
+                    return Hit(track, clip, Zone.FADE_OUT)
+
             # Only offer trim handles when the clip is wide enough that grabbing
             # an edge cannot swallow the whole body.
             if rect.width() > TRIM_GRAB_PX * 3:
@@ -220,6 +338,12 @@ class TimelineCanvas(QWidget):
                     return Hit(track, clip, Zone.IN)
                 if rect.right() - pos.x() <= TRIM_GRAB_PX:
                     return Hit(track, clip, Zone.OUT)
+
+            # Tested after trim, so a line passing near an edge cannot block one.
+            if self.volume_lines and clip.kind == "audio":
+                if abs(pos.y() - self._gain_y(clip.gain_db, rect)) <= GAIN_GRAB_PX:
+                    return Hit(track, clip, Zone.GAIN)
+
             return Hit(track, clip, Zone.BODY)
         return None
 
@@ -348,6 +472,19 @@ class TimelineCanvas(QWidget):
             swatch.setAlpha(70 if not track.muted else 30)
             painter.fillRect(0, top, 3, height, swatch)
 
+            if track.solo:
+                # A badge rather than another word in the flag line: solo is the
+                # state most likely to explain "why can I not hear that lane",
+                # so it has to be findable without reading.
+                badge = QRectF(HEADER_WIDTH - 24.0, top + 7.0, 15.0, 14.0)
+                painter.setRenderHint(QPainter.Antialiasing, True)
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QBrush(theme.SOLO))
+                painter.drawRoundedRect(badge, 3, 3)
+                painter.setRenderHint(QPainter.Antialiasing, False)
+                painter.setPen(theme.BG_DARKEST)
+                painter.drawText(badge, Qt.AlignCenter, "S")
+
             flags = []
             if track.muted:
                 flags.append("muted")
@@ -356,6 +493,12 @@ class TimelineCanvas(QWidget):
             if flags:
                 painter.setPen(theme.WARN)
                 painter.drawText(11, top + 36, " · ".join(flags))
+
+            # The lane's fader position, so the timeline and the mixer cannot
+            # appear to disagree about it. Only where there is room for it.
+            if track.kind == "audio" and track.gain_db != 0.0 and height >= 44:
+                painter.setPen(theme.TEXT_DIM)
+                painter.drawText(11, top + height - 8, f"{track.gain_db:+.1f} dB")
 
     def _clip_colours(self, clip: Clip, selected: bool) -> tuple[QColor, QColor]:
         if clip.kind == "video":
@@ -429,7 +572,24 @@ class TimelineCanvas(QWidget):
                     fill = QColor(fill)
                     fill.setAlpha(190)
 
-                self._paint_clip_body(painter, clip, rect, fill, border, is_selected, metrics)
+                # A gain or fade drag is shown at its proposed value without the
+                # model having been touched, the same as a move or a trim.
+                dragging_this = (
+                    self._level_clip is not None
+                    and self._level_clip.clip_id == clip.clip_id
+                )
+                gain_db = self._gain_db if (dragging_this and self._mode is Mode.GAIN) else clip.gain_db
+                fade_in, fade_out = clip.fade_in, clip.fade_out
+                if dragging_this and self._mode is Mode.FADE:
+                    if self._fade_edge == "in":
+                        fade_in = self._fade_frames
+                    else:
+                        fade_out = self._fade_frames
+
+                self._paint_clip_body(
+                    painter, clip, rect, fill, border, is_selected, metrics,
+                    gain_db=gain_db, fade_in=fade_in, fade_out=fade_out,
+                )
 
     def _paint_clip_body(
         self,
@@ -440,6 +600,10 @@ class TimelineCanvas(QWidget):
         border: QColor,
         is_selected: bool,
         metrics: QFontMetrics,
+        *,
+        gain_db: float = 0.0,
+        fade_in: int = 0,
+        fade_out: int = 0,
     ) -> None:
         """Content on top, a solid name band along the foot, edge over both.
 
@@ -462,6 +626,11 @@ class TimelineCanvas(QWidget):
         if content.height() > 4 and rect.width() > 4:
             if clip.kind == "audio":
                 self._paint_waveform(painter, clip, content)
+                # Over the waveform, under the name band: these describe what
+                # you are looking at, so they have to sit on top of it.
+                self._paint_fades(painter, clip, rect, content, fade_in, fade_out)
+                if self.volume_lines:
+                    self._paint_gain_line(painter, rect, gain_db, metrics)
             elif self.show_filmstrips:
                 self._paint_filmstrip(painter, clip, content)
 
@@ -503,6 +672,101 @@ class TimelineCanvas(QWidget):
                 int(baseline),
                 metrics.elidedText(clip.name or "clip", Qt.ElideMiddle, int(available)),
             )
+
+    def _paint_fades(
+        self,
+        painter: QPainter,
+        clip: Clip,
+        rect: QRectF,
+        content: QRectF,
+        fade_in: int,
+        fade_out: int,
+    ) -> None:
+        """Shade what the fade takes away, and draw the ramp over the waveform.
+
+        Shading the attenuated wedge rather than only drawing a diagonal is what
+        makes the length of a fade readable at a glance: a bare line reads as
+        decoration, a wedge of dimmed waveform reads as a fade.
+
+        Painted on every canvas, not only the one where the handles can be
+        grabbed — a fade set on the Audio page has to be visible on the Edit
+        page, or the two views disagree about the edit.
+        """
+        if fade_in <= 0 and fade_out <= 0:
+            return
+
+        shade = QColor(theme.BG_DARKEST)
+        shade.setAlpha(140)
+        pen = QPen(theme.FADE_CURVE, 1.4)
+
+        painter.save()
+        body = QPainterPath()
+        body.addRoundedRect(rect, CLIP_RADIUS, CLIP_RADIUS)
+        painter.setClipPath(body)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+
+        top, bottom = content.top(), content.bottom()
+        for frames, edge in ((fade_in, "in"), (fade_out, "out")):
+            if frames <= 0:
+                continue
+            width = frames * self.px_per_frame
+            if width < 1.0:
+                continue
+            if edge == "in":
+                corner, inner = rect.left(), rect.left() + width
+            else:
+                corner, inner = rect.right(), rect.right() - width
+
+            wedge = QPainterPath()
+            wedge.moveTo(corner, top)
+            wedge.lineTo(inner, top)
+            wedge.lineTo(corner, bottom)
+            wedge.closeSubpath()
+            painter.fillPath(wedge, shade)
+
+            painter.setPen(pen)
+            painter.drawLine(QPointF(corner, bottom), QPointF(inner, top))
+
+            if self._fades_grabbable(clip, rect):
+                painter.setBrush(QBrush(theme.FADE_CURVE))
+                painter.setPen(Qt.NoPen)
+                painter.drawEllipse(QPointF(inner, top + 1.0), 3.0, 3.0)
+
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        painter.restore()
+
+    def _paint_gain_line(
+        self, painter: QPainter, rect: QRectF, gain_db: float, metrics: QFontMetrics
+    ) -> None:
+        """A horizontal line across the clip at its gain, with a unity reference.
+
+        Two lines rather than one when the clip is off unity: the dotted 0 dB
+        reference gives the solid line something to be read against, so "quieter
+        than it was recorded" is visible without reading a number.
+        """
+        painter.save()
+        body = QPainterPath()
+        body.addRoundedRect(rect, CLIP_RADIUS, CLIP_RADIUS)
+        painter.setClipPath(body)
+
+        if gain_db != 0.0:
+            painter.setPen(QPen(theme.TEXT_FAINT, 1, Qt.DotLine))
+            unity = self._gain_y(0.0, rect)
+            painter.drawLine(QPointF(rect.left(), unity), QPointF(rect.right(), unity))
+
+        y = self._gain_y(gain_db, rect)
+        painter.setPen(QPen(theme.GAIN_LINE, 1.6))
+        painter.drawLine(QPointF(rect.left(), y), QPointF(rect.right(), y))
+
+        if gain_db != 0.0 and rect.width() > 70:
+            label = f"{gain_db:+.1f} dB"
+            painter.setPen(theme.GAIN_LINE)
+            painter.drawText(
+                int(rect.right() - metrics.horizontalAdvance(label) - 6),
+                int(max(rect.top() + metrics.ascent(), y - 3)),
+                label,
+            )
+        painter.restore()
 
     def _paint_lane_change(self, painter: QPainter) -> None:
         """Draw clips that are being dragged onto a different lane."""
@@ -663,6 +927,18 @@ class TimelineCanvas(QWidget):
             self._drag_track = hit.track
             self._drag_target = hit.track
             self._drag_kind = hit.clip.kind
+        elif hit.zone is Zone.GAIN:
+            self._mode = Mode.GAIN
+            self._level_clip = hit.clip
+            self._gain_db = hit.clip.gain_db
+            self._gain_press_db = hit.clip.gain_db
+        elif hit.zone in (Zone.FADE_IN, Zone.FADE_OUT):
+            self._mode = Mode.FADE
+            self._level_clip = hit.clip
+            self._fade_edge = "in" if hit.zone is Zone.FADE_IN else "out"
+            self._fade_frames = (
+                hit.clip.fade_in if self._fade_edge == "in" else hit.clip.fade_out
+            )
         else:
             self._mode = Mode.TRIM
             self._trim_clip = hit.clip
@@ -693,6 +969,44 @@ class TimelineCanvas(QWidget):
             self._drag_delta = snapped - earliest
             self._snap_line = target
             self._drag_target = self._lane_under(pos.y())
+            self.update()
+            return
+
+        if self._mode is Mode.GAIN and self._level_clip is not None:
+            clip = self._level_clip
+            row = self.row_for(clip)
+            if row is not None:
+                rect = self.clip_rect(clip, row[0], row[1])
+                if event.modifiers() & Qt.ShiftModifier:
+                    # Fine adjust: a tenth of the travel, measured from the press
+                    # rather than from the pointer, so it cannot jump on the
+                    # frame the modifier goes down.
+                    delta = self._gain_db_at(pos.y(), rect) - self._gain_db_at(
+                        self._press_pos.y(), rect
+                    )
+                    wanted = self._gain_press_db + delta * 0.1
+                else:
+                    wanted = self._gain_db_at(pos.y(), rect)
+                # A detent at unity: 0 dB is the value people want most and the
+                # hardest to hit by eye.
+                if abs(wanted) < 0.4:
+                    wanted = 0.0
+                self._gain_db = max(MIN_GAIN_DB, min(MAX_GAIN_DB, wanted))
+                self.status_message.emit(f"{clip.name or 'Clip'}: {self._gain_db:+.1f} dB")
+                self.update()
+            return
+
+        if self._mode is Mode.FADE and self._level_clip is not None:
+            clip = self._level_clip
+            if self._fade_edge == "in":
+                wanted = self.frame_of(pos.x()) - clip.tl_start
+                other = clip.fade_out
+            else:
+                wanted = clip.tl_end - self.frame_of(pos.x())
+                other = clip.fade_in
+            self._fade_frames = max(0, min(wanted, clip.duration - other))
+            seconds = float(self.timeline.timebase.frames_to_seconds(self._fade_frames))
+            self.status_message.emit(f"Fade {self._fade_edge} {seconds:.2f}s")
             self.update()
             return
 
@@ -729,12 +1043,22 @@ class TimelineCanvas(QWidget):
                 self.project.edit(
                     f"Trim {edge}", lambda t: ops.trim(t, clip, edge, frame)
                 )
+        elif mode is Mode.GAIN and self._level_clip is not None:
+            clip, gain = self._level_clip, self._gain_db
+            if abs(gain - clip.gain_db) > 1e-6:
+                self._run("Clip gain", ops.set_clip_gain, [clip], gain)
+        elif mode is Mode.FADE and self._level_clip is not None:
+            clip, edge, frames = self._level_clip, self._fade_edge, self._fade_frames
+            current = clip.fade_in if edge == "in" else clip.fade_out
+            if frames != current:
+                self._run(f"Fade {edge}", ops.set_clip_fade, clip, edge, frames)
 
         self._drag_clips = []
         self._drag_delta = 0
         self._drag_target = None
         self._drag_track = None
         self._trim_clip = None
+        self._level_clip = None
         self.update()
 
     def _lane_under(self, y: int) -> Track | None:
@@ -762,11 +1086,18 @@ class TimelineCanvas(QWidget):
             self.setCursor(Qt.ArrowCursor)
         elif hit.zone is Zone.BODY:
             self.setCursor(Qt.OpenHandCursor)
+        elif hit.zone is Zone.GAIN:
+            self.setCursor(Qt.SizeVerCursor)
         else:
             self.setCursor(Qt.SizeHorCursor)
 
     def _toggle_header(self, pos: QPoint) -> None:
-        """Clicking a header toggles mute; shift-clicking toggles lock."""
+        """Clicking a header toggles mute; shift-clicking toggles lock.
+
+        Through the undo stack like the menu path, so muting from the header and
+        muting from the mixer are the same edit rather than two behaviours that
+        happen to look alike.
+        """
         row = self.track_at(pos.y())
         if row is None:
             return
@@ -774,10 +1105,9 @@ class TimelineCanvas(QWidget):
         from PySide6.QtWidgets import QApplication
 
         if QApplication.keyboardModifiers() & Qt.ShiftModifier:
-            track.locked = not track.locked
+            self._set_track_flag(track, "locked", not track.locked)
         else:
-            track.muted = not track.muted
-        self.update()
+            self._set_track_flag(track, "muted", not track.muted)
 
     def _set_playhead_from(self, x: float) -> None:
         frame = max(0, self.frame_of(x))
@@ -852,6 +1182,22 @@ class TimelineCanvas(QWidget):
         toggle = "Disable" if clip.enabled else "Enable"
         menu.addAction(toggle, lambda: self._toggle_enabled(selected))
 
+        if clip.kind == "audio":
+            menu.addSeparator()
+            menu.addAction(
+                f"Normalise to {NORMALISE_TARGET_DB:g} dB", lambda: self._normalise(selected)
+            )
+            if clip.gain_db != 0.0:
+                menu.addAction(
+                    f"Reset Gain (now {clip.gain_db:+.1f} dB)",
+                    lambda: self._run("Clip gain", ops.set_clip_gain, selected, 0.0),
+                )
+            if clip.has_fades:
+                menu.addAction(
+                    "Clear Fades",
+                    lambda: self._run("Clear fades", ops.clear_clip_fades, selected),
+                )
+
         menu.addSeparator()
         menu.addAction("Delete (leave gap)\tBackspace", lambda: self._delete(selected, ripple=False))
         menu.addAction("Ripple Delete\tDelete", lambda: self._delete(selected, ripple=True))
@@ -868,8 +1214,26 @@ class TimelineCanvas(QWidget):
         lock = menu.addAction("Lock" if not track.locked else "Unlock")
         lock.triggered.connect(lambda: self._set_track_flag(track, "locked", not track.locked))
 
+        if track.kind == "audio":
+            solo = menu.addAction("Solo")
+            solo.setCheckable(True)
+            solo.setChecked(track.solo)
+            solo.triggered.connect(
+                lambda: self._run(
+                    ("Unsolo " if track.solo else "Solo ") + track.name,
+                    ops.set_track_solo, track, not track.solo,
+                )
+            )
+            reset = menu.addAction(f"Reset Gain ({track.gain_db:+.1f} dB)")
+            reset.setEnabled(track.gain_db != 0.0)
+            reset.triggered.connect(
+                lambda: self._run("Track gain", ops.set_track_gain, track, 0.0)
+            )
+
         menu.addSeparator()
-        menu.addAction("Add Video Track", lambda: self._add_track("video"))
+        # No point offering a video lane on a canvas that cannot show one.
+        if "video" in self.kinds:
+            menu.addAction("Add Video Track", lambda: self._add_track("video"))
         menu.addAction("Add Audio Track", lambda: self._add_track("audio"))
 
         siblings = self.timeline.video_tracks if track.kind == "video" else self.timeline.audio_tracks
@@ -910,6 +1274,37 @@ class TimelineCanvas(QWidget):
         if accepted:
             self._apply_speed(factor)
 
+    def _normalise(self, clips: list[Clip]) -> None:
+        """Set each clip's gain so its loudest peak lands at the target.
+
+        Measured from the peak file made at ingest — the same data the waveform
+        is drawn from — so it is instant and touches no media. Measuring only
+        the clip's own window matters: normalising against the whole source
+        would be wrong for a clip trimmed away from the loud part, which is
+        exactly the case people reach for this in.
+        """
+        gains: dict[str, float] = {}
+        for clip in clips:
+            if clip.kind != "audio":
+                continue
+            peaks = self.waveforms.get(
+                clip.media_id, self.project.proxies.peaks_for(clip.media_id)
+            )
+            if peaks is None:
+                continue
+            gains[clip.clip_id] = levels.normalise_gain_db(
+                peaks,
+                src_in=clip.src_in,
+                src_out=clip.src_out,
+                timebase=self.timeline.timebase,
+                target_db=NORMALISE_TARGET_DB,
+            )
+
+        if not gains:
+            self.status_message.emit("No peak data for those clips yet")
+            return
+        self._run("Normalise", ops.normalise_clips, clips, gains)
+
     def _toggle_enabled(self, clips: list[Clip]) -> None:
         wanted = not clips[0].enabled
 
@@ -931,9 +1326,14 @@ class TimelineCanvas(QWidget):
         self.project.edit("Link clips", lambda t: ops.link(t, clips))
 
     def _set_track_flag(self, track: Track, flag: str, value: bool) -> None:
-        setattr(track, flag, value)
-        # Muting changes what the player should read, so rebuild the playlists.
-        self.project.timeline_changed.emit()
+        # Through the undo stack, not a bare setattr: muting is an edit like any
+        # other, and doing it directly meant it was neither undoable nor counted
+        # as an unsaved change.
+        operation = ops.set_track_muted if flag == "muted" else ops.set_track_locked
+        label = ("Mute " if value else "Unmute ") if flag == "muted" else (
+            "Lock " if value else "Unlock "
+        )
+        self._run(label + track.name, operation, track, value)
         self.update()
 
     def _add_track(self, kind: str) -> None:
@@ -1081,6 +1481,17 @@ class TimelineCanvas(QWidget):
             frame = max(clip.tl_end for clip in clips)
             placed += 1
 
+            # On an audio-only canvas the picture half of a linked pair lands on
+            # a lane that is not on screen. That is the right thing to do, but it
+            # is invisible, so it gets said out loud.
+            if "video" not in self.kinds:
+                elsewhere = [clip for clip in clips if clip.kind == "video"]
+                if elsewhere:
+                    lane = self.timeline.track_of(elsewhere[0])
+                    self.status_message.emit(
+                        f"Video from {info.name} went to {lane.name}"
+                    )
+
         if placed:
             event.acceptProposedAction()
         self.update()
@@ -1091,10 +1502,12 @@ class TimelinePanel(QWidget):
 
     status_message = Signal(str)
 
-    def __init__(self, project: Project, parent=None) -> None:
+    def __init__(self, project: Project, parent=None, **canvas_options) -> None:
         super().__init__(parent)
         self.project = project
-        self.canvas = TimelineCanvas(project, self)
+        # Options pass straight through: the panel has no opinion about which
+        # lanes the canvas shows, it only wraps it in scrollbars.
+        self.canvas = TimelineCanvas(project, self, **canvas_options)
         self.canvas.status_message.connect(self.status_message)
 
         self.scrollbar = QScrollBar(Qt.Horizontal, self)

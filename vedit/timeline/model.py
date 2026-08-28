@@ -26,6 +26,13 @@ TrackKind = Literal["video", "audio"]
 MIN_SPEED = 0.1
 MAX_SPEED = 10.0
 
+# Gain range shared by clips, tracks and the master. -60 dB is inaudible against
+# any real programme material, so it is where the fader bottoms out rather than a
+# separate "off"; +12 dB is enough to rescue a quiet recording and not enough to
+# destroy one.
+MIN_GAIN_DB = -60.0
+MAX_GAIN_DB = 12.0
+
 _ids = itertools.count(1)
 
 
@@ -57,6 +64,9 @@ class Clip:
     clip_id: str = field(default_factory=lambda: new_id("c"))
     name: str = ""
     enabled: bool = True
+    gain_db: float = 0.0   # clip trim, applied before the track fader
+    fade_in: int = 0       # timeline frames from tl_start
+    fade_out: int = 0      # timeline frames ending at tl_end
 
     def __post_init__(self) -> None:
         if self.src_in < 0:
@@ -75,6 +85,12 @@ class Clip:
                 f"clip {self.name or self.clip_id}: speed {self.speed} is outside "
                 f"{MIN_SPEED}x to {MAX_SPEED}x"
             )
+        if not MIN_GAIN_DB <= self.gain_db <= MAX_GAIN_DB:
+            raise TimelineError(
+                f"clip {self.name or self.clip_id}: gain {self.gain_db} dB is outside "
+                f"{MIN_GAIN_DB} to {MAX_GAIN_DB}"
+            )
+        self.clamp_fades()
 
     # -- geometry --------------------------------------------------------------
 
@@ -124,6 +140,24 @@ class Clip:
             return timeline_frames
         return int(round(timeline_frames * self.speed))
 
+    # -- fades -----------------------------------------------------------------
+
+    def clamp_fades(self) -> None:
+        """Keep both fades inside the clip.
+
+        Clamped rather than rejected, because a fade is set by dragging and a
+        later trim can legitimately shorten the clip out from under one. When
+        there is not room for both, the fade in wins — an arbitrary choice, but
+        one that has to be made somewhere and stay put.
+        """
+        span = self.duration
+        self.fade_in = max(0, min(self.fade_in, span))
+        self.fade_out = max(0, min(self.fade_out, span - self.fade_in))
+
+    @property
+    def has_fades(self) -> bool:
+        return self.fade_in > 0 or self.fade_out > 0
+
     # -- headroom for trimming -------------------------------------------------
 
     @property
@@ -157,6 +191,8 @@ class Track:
     muted: bool = False
     locked: bool = False
     track_id: str = field(default_factory=lambda: new_id("t"))
+    gain_db: float = 0.0
+    solo: bool = False
 
     def __iter__(self) -> Iterator[Clip]:
         return iter(self.clips)
@@ -254,14 +290,23 @@ class Track:
             previous = clip
 
     def copy(self) -> Track:
-        return Track(
-            kind=self.kind,
-            name=self.name,
-            clips=[clip.copy() for clip in self.clips],
-            muted=self.muted,
-            locked=self.locked,
-            track_id=self.track_id,
-        )
+        # `replace` rather than a hand-written constructor call: the field list
+        # was already once a place where a new field could be silently dropped,
+        # and every undo would then quietly reset it.
+        return replace(self, clips=[clip.copy() for clip in self.clips])
+
+
+@dataclass(slots=True)
+class TimelineState:
+    """Everything the undo stack has to restore.
+
+    The snapshot used to be a bare list of tracks, which meant any state living
+    on the `Timeline` itself was invisible to undo. Master gain is the first such
+    field, so the snapshot grew a shape rather than the field being left out.
+    """
+
+    tracks: list[Track]
+    master_gain_db: float = 0.0
 
 
 @dataclass(slots=True)
@@ -273,6 +318,7 @@ class Timeline:
     height: int = 1080
     sample_rate: int = 48000
     tracks: list[Track] = field(default_factory=list)
+    master_gain_db: float = 0.0
 
     @classmethod
     def default(
@@ -351,6 +397,21 @@ class Timeline:
     def editable_tracks(self) -> list[Track]:
         return [track for track in self.tracks if not track.locked]
 
+    def audible_audio_tracks(self) -> list[Track]:
+        """Audio lanes that should be heard, honouring both mute and solo.
+
+        The single definition of audibility: preview, render and the mixer all
+        call this and nothing else, because a solo that means one thing on the
+        Audio page and another in the exported file is worse than no solo.
+
+        Solo is additive — several lanes can be soloed at once — and it does not
+        override mute, so a lane that is both soloed and muted stays silent and a
+        stale solo cannot resurrect something deliberately killed.
+        """
+        lanes = [track for track in self.audio_tracks if not track.muted]
+        soloed = [track for track in lanes if track.solo]
+        return soloed or lanes
+
     def lane_for(self, kind: TrackKind) -> Track:
         """The first lane of a kind — where media lands unless told otherwise."""
         lanes = self.video_tracks if kind == "video" else self.audio_tracks
@@ -401,13 +462,24 @@ class Timeline:
         for track in self.tracks:
             track.validate()
 
-    def snapshot(self) -> list[Track]:
-        """Deep copy of the track list, used by the undo stack."""
-        return [track.copy() for track in self.tracks]
+    def snapshot(self) -> TimelineState:
+        """Deep copy of the undoable state, used by the undo stack."""
+        return TimelineState(
+            tracks=[track.copy() for track in self.tracks],
+            master_gain_db=self.master_gain_db,
+        )
 
-    def restore(self, snapshot: Iterable[Track]) -> None:
-        """Replace contents in place, so UI holding this object stays valid."""
-        self.tracks = [track.copy() for track in snapshot]
+    def restore(self, snapshot: TimelineState | Iterable[Track]) -> None:
+        """Replace contents in place, so UI holding this object stays valid.
+
+        A bare iterable of tracks is still accepted: tests and any caller that
+        only cares about the lanes should not have to build a state object.
+        """
+        if isinstance(snapshot, TimelineState):
+            self.tracks = [track.copy() for track in snapshot.tracks]
+            self.master_gain_db = snapshot.master_gain_db
+        else:
+            self.tracks = [track.copy() for track in snapshot]
 
     def seconds(self, frames: int) -> float:
         """Frames to seconds — only for handing across the FFmpeg boundary."""

@@ -230,3 +230,94 @@ def test_two_audio_lanes_are_mixed(sources, tmp_path):
     audio = next(s for s in data["streams"] if s["codec_type"] == "audio")
     assert int(audio["channels"]) == 2
     assert float(data["format"]["duration"]) == pytest.approx(4.0, abs=0.15)
+
+
+def mean_volume(path, *, start, duration):
+    """Mean level of a window of a file, in dBFS.
+
+    `volumedetect` reports at info level, so the usual `-v error` would swallow
+    the only line worth reading.
+    """
+    result = subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-ss", str(start), "-t", str(duration),
+            "-i", str(path), "-af", "volumedetect", "-f", "null", "-",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    lines = [line for line in result.stderr.splitlines() if "mean_volume" in line]
+    assert lines, f"volumedetect said nothing:\n{result.stderr[-1000:]}"
+    return float(lines[0].split("mean_volume:")[1].split()[0])
+
+
+def render_audio(timeline, pool, output):
+    preset = preset_by_key("h264_mp4").with_quality(30).with_size(320, 180)
+    args = build_command(timeline, pool, preset, output, progress_to_stdout=False)
+    result = subprocess.run(args, capture_output=True, text=True)
+    assert result.returncode == 0, f"ffmpeg failed:\n{result.stderr[-2000:]}"
+    return args[args.index("-filter_complex") + 1]
+
+
+def test_a_fade_out_is_audible_in_the_rendered_file(sources, tmp_path):
+    """The end-to-end proof that a fade set on the Audio page reaches the export.
+
+    Measured rather than asserted on the filter string, because the string being
+    right and the audio being right are two different claims.
+    """
+    info_a, _ = sources
+    timeline = Timeline.default(TimeBase(30), width=320, height=180)
+    ops.place_media(timeline, info_a, 0)
+
+    clip = timeline.audio_tracks[0].clips[0]
+    ops.set_clip_fade(timeline, clip, "out", 60)      # the last two seconds
+
+    output = tmp_path / "faded.mp4"
+    graph = render_audio(timeline, Pool([info_a]), output)
+    assert "afade=t=out:st=2.000000:d=2.000000" in graph
+
+    head = mean_volume(output, start=0.3, duration=1.0)
+    tail = mean_volume(output, start=3.2, duration=0.7)
+    assert tail < head - 6, f"the tail ({tail} dB) is not quieter than the head ({head} dB)"
+
+
+def test_master_gain_attenuates_the_whole_mix(sources, tmp_path):
+    """A control render at unity, so the measurement isolates the fader.
+
+    Comparing against the source file instead would fold in the mono-to-stereo
+    conversion, which costs its own 3 dB and has nothing to do with the mixer.
+    """
+    info_a, _ = sources
+    pool = Pool([info_a])
+
+    def render(master_db, name):
+        timeline = Timeline.default(TimeBase(30), width=320, height=180)
+        ops.place_media(timeline, info_a, 0)
+        ops.set_master_gain(timeline, master_db)
+        output = tmp_path / name
+        render_audio(timeline, pool, output)
+        return mean_volume(output, start=0.3, duration=1.0)
+
+    unity = render(0.0, "unity.mp4")
+    quieter = render(-6.0, "down.mp4")
+    assert quieter - unity == pytest.approx(-6.0, abs=0.35)
+
+
+def test_a_soloed_lane_is_the_only_one_exported(sources, tmp_path):
+    """The one line that keeps solo meaning the same thing in preview and export."""
+    info_a, info_b = sources
+    timeline = Timeline.default(TimeBase(30), width=320, height=180)
+
+    ops.place_media(timeline, info_a, 0)
+    second = ops.make_clips(info_b, timeline.timebase)[1]
+    second.tl_start = 0
+    timeline.audio_tracks[1].insert(second)
+    timeline.audio_tracks[1].solo = True
+
+    output = tmp_path / "soloed.mp4"
+    graph = render_audio(timeline, Pool([info_a, info_b]), output)
+    assert "amix" not in graph, "the un-soloed lane is still in the mix"
+
+    data = ffprobe(output)
+    assert any(s["codec_type"] == "audio" for s in data["streams"])

@@ -51,7 +51,10 @@ def add(timeline, media_id, tl_start, length, *, src_in=0, kind="video", track=N
         src_length=src_in + length + 500,
         kind=kind,
     )
-    (track or timeline.lane_for(kind)).insert(clip)
+    # `is None`, not `or`: Track defines __len__, so an empty lane is falsy and
+    # `track or ...` would silently drop the clip on A1 instead.
+    lane = timeline.lane_for(kind) if track is None else track
+    lane.insert(clip)
     return clip
 
 
@@ -195,3 +198,108 @@ class TestPresets:
     def test_filename_uses_the_container(self):
         assert preset_by_key("h264_mp4").filename_for("cut") == "cut.mp4"
         assert preset_by_key("prores_mov").filename_for("cut") == "cut.mov"
+
+
+class TestLevels:
+    """Gain, fades, solo and master in the filter graph.
+
+    The first test is the important one: everything below only fires when it has
+    something to say, so an unmixed timeline still renders the command it always
+    did and every assertion elsewhere in this file stays honest.
+    """
+
+    def preset(self):
+        return preset_by_key("h264_mp4")
+
+    def build(self, timeline, pool):
+        return filter_of(build_command(timeline, pool, self.preset(), Path("/out.mp4")))
+
+    def test_an_unmixed_timeline_emits_nothing(self, timeline, pool):
+        add(timeline, "m1", 0, 60)
+        add(timeline, "m1", 0, 60, kind="audio")
+        graph = self.build(timeline, pool)
+        assert "volume=" not in graph
+        assert "afade" not in graph
+        assert "aout_pre" not in graph
+
+    def test_clip_gain_becomes_a_volume_filter(self, timeline, pool):
+        clip = add(timeline, "m1", 0, 60, kind="audio")
+        clip.gain_db = 6.0
+        assert "volume=1.995262" in self.build(timeline, pool)
+
+    def test_a_negative_clip_gain_attenuates(self, timeline, pool):
+        clip = add(timeline, "m1", 0, 60, kind="audio")
+        clip.gain_db = -6.0
+        assert "volume=0.501187" in self.build(timeline, pool)
+
+    def test_fade_in_starts_at_the_pieces_own_zero(self, timeline, pool):
+        clip = add(timeline, "m1", 0, 60, kind="audio")
+        clip.fade_in = 15                       # half a second at 30 fps
+        assert "afade=t=in:st=0:d=0.500000" in self.build(timeline, pool)
+
+    def test_fade_out_starts_a_fade_before_the_end(self, timeline, pool):
+        clip = add(timeline, "m1", 0, 60, kind="audio")
+        clip.fade_out = 30                      # one second of a two-second clip
+        assert "afade=t=out:st=1.000000:d=1.000000" in self.build(timeline, pool)
+
+    def test_both_fades_on_one_piece(self, timeline, pool):
+        clip = add(timeline, "m1", 0, 60, kind="audio")
+        clip.fade_in, clip.fade_out = 15, 15
+        graph = self.build(timeline, pool)
+        assert "afade=t=in:st=0:d=0.500000" in graph
+        assert "afade=t=out:st=1.500000:d=0.500000" in graph
+
+    def test_video_clips_never_carry_levels(self, timeline, pool):
+        clip = add(timeline, "m1", 0, 60)
+        clip.gain_db = 6.0
+        clip.fade_in = 15
+        graph = self.build(timeline, pool)
+        assert "volume=" not in graph
+        assert "afade" not in graph
+
+    def test_track_gain_lands_after_the_lane_concat(self, timeline, pool):
+        add(timeline, "m1", 0, 60, kind="audio")
+        timeline.audio_tracks[0].gain_db = -6.0
+        graph = self.build(timeline, pool)
+        assert "[alane0]volume=0.501187[alane0g]" in graph
+        assert "[alane0g]anull[aout]" in graph
+
+    def test_master_gain_lands_after_the_mix(self, timeline, pool):
+        add(timeline, "m1", 0, 60, kind="audio")
+        timeline.master_gain_db = -6.0
+        graph = self.build(timeline, pool)
+        assert "[aout_pre]" in graph
+        assert "[aout_pre]volume=0.501187[aout]" in graph
+
+    def test_master_gain_after_a_real_mix(self, timeline, pool):
+        add(timeline, "m1", 0, 60, kind="audio", track=timeline.audio_tracks[0])
+        add(timeline, "m2", 0, 60, kind="audio", track=timeline.audio_tracks[1])
+        timeline.master_gain_db = 3.0
+        graph = self.build(timeline, pool)
+        assert "amix=inputs=2" in graph and "[aout_pre]" in graph
+        assert graph.endswith("volume=1.412538[aout]")
+
+    def test_a_muted_lane_is_left_out(self, timeline, pool):
+        add(timeline, "m1", 0, 60, kind="audio", track=timeline.audio_tracks[0])
+        add(timeline, "m2", 0, 60, kind="audio", track=timeline.audio_tracks[1])
+        timeline.audio_tracks[1].muted = True
+        graph = self.build(timeline, pool)
+        assert "amix" not in graph
+        assert "alane1" not in graph
+
+    def test_solo_silences_the_others(self, timeline, pool):
+        """The line that keeps preview and export agreeing about solo."""
+        add(timeline, "m1", 0, 60, kind="audio", track=timeline.audio_tracks[0])
+        add(timeline, "m2", 0, 60, kind="audio", track=timeline.audio_tracks[1])
+        timeline.audio_tracks[1].solo = True
+        graph = self.build(timeline, pool)
+        assert "amix" not in graph
+        assert "[1:a]" in graph and "[0:a]" not in graph
+
+    def test_a_razored_half_does_not_restart_its_fade(self, timeline, pool):
+        """Only the piece covering the clip's own edge carries the fade."""
+        clip = add(timeline, "m1", 0, 60, kind="audio")
+        clip.fade_in = 15
+        add(timeline, "m2", 60, 60, kind="audio")
+        graph = self.build(timeline, pool)
+        assert graph.count("afade=t=in") == 1

@@ -28,12 +28,17 @@ from PySide6.QtWidgets import (
 from vedit import theme
 from vedit.core.project import Project
 from vedit.core.projectfile import SUFFIX, ProjectFileError
+from vedit.pages.audio_page import AudioPage
 from vedit.pages.edit_page import EditPage
 from vedit.pages.media_page import MediaPage
 from vedit.pages.render_page import RenderPage
+from vedit.player.engine import PlaybackEngine
 from vedit.timeline import ops
 
-PAGES = ("Media", "Edit", "Render")
+PAGES = ("Media", "Edit", "Audio", "Render")
+# Pages that own a viewer. Switching to one of these hands it the shared engine's
+# picture; every other page leaves playback alone.
+VIEWER_PAGES = (1, 2)
 
 
 class PageBar(QWidget):
@@ -85,15 +90,22 @@ class MainWindow(QMainWindow):
 
         self.project = project or Project()
 
+        # One engine for the whole window. Every page that shows a viewer is
+        # pointed at it in turn; two engines would mean two decoder threads and
+        # two audio devices contending for the same timeline.
         self.media_page = MediaPage(self.project)
-        self.edit_page = EditPage(self.project)
+        self.engine = PlaybackEngine(self.project, parent=self)
+        self.edit_page = EditPage(self.project, self.engine)
+        self.audio_page = AudioPage(self.project, self.engine)
         self.render_page = RenderPage(self.project)
+        self.engine.set_surface(self.edit_page.surface)
 
         # Sending media to the timeline is what moves you between pages, so both
         # routes into the Edit page live here rather than inside a page.
         self.media_page.append_requested.connect(self.append_media)
         self.media_page.media_activated.connect(self.append_media)
         self.edit_page.status_message.connect(lambda m: self.statusBar().showMessage(m, 6000))
+        self.audio_page.status_message.connect(lambda m: self.statusBar().showMessage(m, 6000))
         self.render_page.status_message.connect(lambda m: self.statusBar().showMessage(m, 6000))
         self.project.pool.import_failed.connect(self._on_import_failed)
         self.project.proxies.failed.connect(
@@ -101,7 +113,7 @@ class MainWindow(QMainWindow):
         )
 
         self.stack = QStackedWidget()
-        for page in (self.media_page, self.edit_page, self.render_page):
+        for page in (self.media_page, self.edit_page, self.audio_page, self.render_page):
             self.stack.addWidget(page)
 
         self.page_bar = PageBar(self.show_page)
@@ -165,6 +177,9 @@ class MainWindow(QMainWindow):
     def show_page(self, index: int) -> None:
         self.stack.setCurrentIndex(index)
         self.page_bar.select(index)
+        # Playback carries on across the switch; only the picture moves.
+        if index in VIEWER_PAGES:
+            self.engine.set_surface(self.stack.widget(index).surface)
 
     # -- actions ---------------------------------------------------------------
 
@@ -246,7 +261,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Cannot open project", str(exc))
             return
 
-        self.edit_page.engine.invalidate()
+        self.engine.invalidate()
         self.edit_page.timeline_panel.canvas.zoom_to_fit()
         self._update_title()
 
@@ -289,7 +304,7 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         # Stop every child process so no ffmpeg outlives the window.
-        self.edit_page.shutdown()
+        self.engine.stop()
         self.render_page.shutdown()
         self.project.shutdown()
         super().closeEvent(event)
@@ -300,6 +315,7 @@ def main() -> int:
     app.setApplicationName("vedit")
     app.setApplicationDisplayName("vedit")
     app.setStyle("Fusion")
+    app.setPalette(theme.palette())
     app.setStyleSheet(theme.stylesheet())
 
     window = MainWindow()

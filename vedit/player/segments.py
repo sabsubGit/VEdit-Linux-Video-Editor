@@ -9,12 +9,13 @@ as possible.
 from __future__ import annotations
 
 import bisect
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from vedit.core.timebase import TimeBase
 from vedit.media.pool import MediaPool
 from vedit.media.proxy import ProxyManager
+from vedit.timeline.levels import from_db
 from vedit.timeline.model import Clip, Timeline, Track
 
 
@@ -28,6 +29,13 @@ class Segment:
     src_start: int         # offset into the source, in timeline frames
     media_id: str = ""
     speed: float = 1.0
+    clip_id: str = ""
+    # Level shaping, carried here so the audio thread never has to look a clip
+    # up. Gain is linear rather than dB: the mixer applies it once per block and
+    # has no business doing a pow() in the hot path.
+    gain: float = 1.0
+    fade_in: int = 0       # timeline frames from tl_start
+    fade_out: int = 0      # timeline frames ending at tl_end
 
     @property
     def duration(self) -> int:
@@ -55,9 +63,13 @@ class Segment:
 class Playlist:
     """An ordered, gap-filled segment list with a fast lookup by frame."""
 
-    def __init__(self, segments: list[Segment], duration: int) -> None:
+    def __init__(self, segments: list[Segment], duration: int, track_id: str = "") -> None:
         self.segments = segments
         self.duration = duration
+        # Which lane this came from. The mixer keys live fader positions and
+        # meter readings by it, so a playlist that has lost its lane identity is
+        # a strip that cannot be found.
+        self.track_id = track_id
         self._starts = [segment.tl_start for segment in segments]
 
     def __len__(self) -> int:
@@ -97,7 +109,7 @@ def build_playlist(
     """
     duration = timeline.duration
     if track is None or duration <= 0:
-        return Playlist([], duration)
+        return Playlist([], duration, track.track_id if track is not None else "")
 
     segments: list[Segment] = []
     cursor = 0
@@ -119,6 +131,10 @@ def build_playlist(
                 src_start=clip.src_in,
                 media_id=clip.media_id,
                 speed=clip.speed,
+                clip_id=clip.clip_id,
+                gain=from_db(clip.gain_db) if clip.kind == "audio" else 1.0,
+                fade_in=clip.fade_in if clip.kind == "audio" else 0,
+                fade_out=clip.fade_out if clip.kind == "audio" else 0,
             )
         )
         cursor = clip.tl_end
@@ -126,7 +142,7 @@ def build_playlist(
     if cursor < duration:
         segments.append(Segment(cursor, duration, None, 0))
 
-    return Playlist(segments, duration)
+    return Playlist(segments, duration, track.track_id)
 
 
 def build_video_playlist(
@@ -187,6 +203,7 @@ def build_video_playlist(
                 src_start=winner.source_frame_at(start),
                 media_id=winner.media_id,
                 speed=winner.speed,
+                clip_id=winner.clip_id,
             )
         )
 
@@ -209,6 +226,10 @@ def _merge_adjacent(segments: list[Segment]) -> list[Segment]:
                 and last.path == segment.path
                 and last.media_id == segment.media_id
                 and last.speed == segment.speed
+                # Same clip, not merely the same file: two pieces of one clip can
+                # be rejoined, two different clips of the same source cannot,
+                # because they may carry different gain or fades.
+                and last.clip_id == segment.clip_id
                 and (
                     segment.is_gap
                     or last.src_start + int(round((last.tl_end - last.tl_start) * last.speed))
@@ -216,10 +237,7 @@ def _merge_adjacent(segments: list[Segment]) -> list[Segment]:
                 )
             )
             if continuous:
-                merged[-1] = Segment(
-                    last.tl_start, segment.tl_end, last.path, last.src_start,
-                    last.media_id, last.speed,
-                )
+                merged[-1] = replace(last, tl_end=segment.tl_end)
                 continue
         merged.append(segment)
     return merged
@@ -232,9 +250,13 @@ def audio_playlists(
     *,
     use_proxies: bool = True,
 ) -> list[Playlist]:
-    """One playlist per audible audio lane, for the mixer to sum."""
+    """One playlist per audible audio lane, for the mixer to sum.
+
+    `audible_audio_tracks` rather than a local mute test, so solo means the same
+    thing here as it does in the render graph.
+    """
     return [
         build_playlist(timeline, track, pool, proxies, use_proxies=use_proxies)
-        for track in timeline.audio_tracks
-        if not track.muted and track.clips
+        for track in timeline.audible_audio_tracks()
+        if track.clips
     ]

@@ -10,7 +10,7 @@ vedit does the 90% case well: **import anything, cut it, export it.**
 
 ## What it does
 
-Three pages, mirroring how the work splits up.
+Four pages, mirroring how the work splits up.
 
 - **Media** — drag and drop files or folders into the pool. Thumbnails, waveform
   peaks, filmstrips and preview proxies generate in the background.
@@ -19,6 +19,11 @@ Three pages, mirroring how the work splits up.
   their waveform, with the clip name in a band along the foot and a chain mark on
   anything still linked to its A/V partner. Razor, trim, move, ripple delete,
   clip speed, undo.
+- **Audio** — the same timeline with only its audio lanes, drawn twice as tall.
+  Drag the line across a clip to set its level, drag the top corners inward for
+  fades, or right-click to normalise. A mixer along the foot gives every lane a
+  dB fader, mute and solo, and a peak meter with a held peak and a clip
+  indicator, plus a master. Everything you hear here is what gets exported.
 - **Render** — pick a preset and a destination, queue it, watch it go.
 
 ## Requirements
@@ -83,7 +88,7 @@ segment is normalised before concatenation.
 | `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo |
 | `Ctrl+A` / `Esc` | Select all / deselect |
 | `Ctrl+S` / `Ctrl+O` | Save / open project |
-| `Shift+1/2/3` | Media / Edit / Render page |
+| `Shift+1/2/3/4` | Media / Edit / Audio / Render page |
 
 Mouse: click the ruler or an empty part of a lane to move the playhead — during
 playback too, which jumps there and keeps playing. Drag a clip body to move it
@@ -93,8 +98,14 @@ wheel to scroll lanes, `Shift`+wheel to scroll along the timeline. Click a track
 header to mute it, `Shift`-click to lock it.
 
 **Right-click a clip** for cut, speed (¼× to 4×, or a custom multiplier),
-link/unlink, enable/disable and delete. **Right-click a track header** to mute,
-lock, add, clear or delete lanes.
+link/unlink, enable/disable and delete; audio clips also offer normalise, reset
+gain and clear fades. **Right-click a track header** to mute, lock, solo, reset
+the lane gain, or add, clear and delete lanes.
+
+On the Audio page, drag a clip's volume line up and down to set its gain (hold
+`Shift` to fine-adjust, and it detents at 0 dB), and drag the small handles at
+its top corners inward to fade in and out. Faders respond as you drag them and
+land on the undo stack once, when you let go. Double-click a fader for 0 dB.
 
 ## How it works
 
@@ -126,6 +137,24 @@ and discard everything in between — 12 fps reaching the screen on a 30 fps
 timeline. [`player/clock.py`](vedit/player/clock.py) free-runs on monotonic time
 and is disciplined *toward* the audio position, correcting small errors gradually
 and snapping only on large ones. Every decoded frame now gets displayed.
+
+**The meters show what you hear, not what was decoded.** The decoder runs about
+0.6 s ahead of the audio device, so metering the block it has just mixed would
+put the bars ahead of the sound. Because the ring buffer is a strict FIFO, the
+n-th sample written is the n-th played — so each block's peaks are stamped with
+their position in the output stream and held until `processedUSecs()` says the
+device has played past them. Underrun padding is discounted, or a single hiccup
+would offset the meters permanently.
+[`player/audio.py`](vedit/player/audio.py) does the stamping;
+`MeterQueue.drain()` takes the heard position as an argument precisely so the
+rule can be tested with no audio device in the process.
+
+**Faders are read live; clip gain is baked in.** A lane or master fader writes to
+a small locked structure the mix loop reads once per block, so dragging one never
+rebuilds a playlist or restarts the device. Clip gain and fades travel on the
+segments instead, because they are part of the edit rather than a monitoring
+level — and a playlist signature check means every *other* edit, including a
+video-only trim, no longer restarts audio either.
 
 **Undo is snapshot-based.** Timelines are small enough that copying the whole
 track list per edit costs far less than the bugs you get from hand-written

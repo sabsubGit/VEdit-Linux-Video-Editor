@@ -14,7 +14,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Callable, TypeVar
 
-from vedit.timeline.model import Timeline, Track
+from vedit.timeline.model import Timeline, TimelineState
 
 T = TypeVar("T")
 
@@ -22,8 +22,8 @@ T = TypeVar("T")
 @dataclass(slots=True)
 class Entry:
     label: str
-    before: list[Track]
-    after: list[Track]
+    before: TimelineState
+    after: TimelineState
 
 
 class UndoStack:

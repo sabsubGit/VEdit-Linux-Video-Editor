@@ -13,11 +13,23 @@ Several audio lanes play at once, so each lane gets a `_LaneReader` that hands
 out PCM on demand and the mixer sums them. Pulling a fixed block from every lane
 and adding is what keeps the lanes sample-aligned; letting each lane write into
 the buffer at its own pace would drift them apart within seconds.
+
+Levels are applied at three points, in this order: clip gain and fades inside the
+lane reader, the lane fader as the mixer pulls each block, and the master fader
+on the sum. The render graph applies the same three in the same order, which is
+what makes the exported file sound like what was monitored.
+
+Everything between the resampler and the final int16 cast is **float32**. A clip
+boosted to +6 dB clipped in the reader, clipped again after the lane fader and
+clipped a third time after the master is triple-clipped rubbish; in float there
+is exactly one clip, at the end, where it belongs.
 """
 
 from __future__ import annotations
 
+import collections
 import threading
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import av
@@ -28,11 +40,48 @@ from PySide6.QtMultimedia import QAudioFormat, QAudioSink, QMediaDevices
 
 from vedit.core.timebase import TimeBase
 from vedit.player.segments import Playlist, Segment
+from vedit.timeline.levels import from_db
+from vedit.timeline.model import Timeline
 
 SAMPLE_RATE = 48000
 CHANNELS = 2
 BYTES_PER_FRAME = CHANNELS * 2      # int16 stereo
 TARGET_BUFFER_SECONDS = 0.6         # how far ahead the decoder works
+
+
+def envelope(
+    count: int,
+    *,
+    offset: int,
+    length: int,
+    fade_in: int,
+    fade_out: int,
+    gain: float,
+) -> np.ndarray:
+    """The gain curve for `count` sample-frames starting `offset` into a segment.
+
+    Every position is measured from the start of the *segment*, not the start of
+    the block. That is the whole point: blocks arrive about 50 ms at a time, so a
+    two-second fade is spread across forty of them, and a curve derived from the
+    position within a block would restart the ramp forty times.
+
+    Linear ramps, matching the `curve=tri` default of ffmpeg's `afade` — the
+    preview and the export have to agree on the shape, not only the length.
+
+    A module-level function rather than a method so it can be tested with no
+    file, no device and no thread.
+    """
+    if fade_in <= 0 and fade_out <= 0:
+        return np.full(count, gain, dtype=np.float32)
+
+    index = np.arange(offset, offset + count, dtype=np.float32)
+    curve = np.ones(count, dtype=np.float32)
+    if fade_in > 0:
+        np.minimum(curve, index / float(fade_in), out=curve)
+    if fade_out > 0:
+        np.minimum(curve, (float(length) - index) / float(fade_out), out=curve)
+    np.clip(curve, 0.0, 1.0, out=curve)
+    return curve * np.float32(gain)
 
 
 class _RingBuffer:
@@ -94,6 +143,13 @@ class _SinkDevice(QIODevice):
         super().__init__(parent)
         self.ring = ring
         self.consumed_bytes = 0
+        # Silence handed back on an underrun. It advances the device's own clock
+        # but was never metered, so the meter has to discount it or one hiccup
+        # offsets the bars ahead of the sound permanently. Written only by Qt's
+        # audio thread and read only by the UI thread, so a stale read is
+        # possible and a torn one is not — taking a lock inside the audio
+        # callback would be the worse trade.
+        self.padded_bytes = 0
 
     def readData(self, maxlen: int) -> bytes:
         data = self.ring.read(int(maxlen))
@@ -104,6 +160,7 @@ class _SinkDevice(QIODevice):
             padding = min(int(maxlen), 4096)
             padding -= padding % BYTES_PER_FRAME
             self.consumed_bytes += padding
+            self.padded_bytes += padding
             return bytes(padding)
         self.consumed_bytes += len(data)
         return data
@@ -131,12 +188,15 @@ class _LaneReader:
     1.56x further along than the audio it has actually produced. It then runs off
     the end of the timeline early and the lane goes silent for the rest of
     playback — on an 18-second timeline, after about 11 seconds.
+
+    Hands back **float32**, already carrying each clip's own gain and fades. The
+    lane fader and the master are applied further up, by the mixer.
     """
 
     def __init__(self, playlist: Playlist, timebase: TimeBase, start_frame: int) -> None:
         self.playlist = playlist
         self.timebase = timebase
-        self._pending = np.zeros(0, dtype=np.int16)
+        self._pending = np.zeros(0, dtype=np.float32)
         self._container = None
         self._segment: Segment | None = None
         self._frames = None
@@ -177,8 +237,8 @@ class _LaneReader:
     # -- reading ---------------------------------------------------------------
 
     def read(self, wanted: int, stop: threading.Event) -> np.ndarray:
-        """`wanted` interleaved stereo sample-frames as int16."""
-        out = np.zeros(wanted * CHANNELS, dtype=np.int16)
+        """`wanted` interleaved stereo sample-frames as float32."""
+        out = np.zeros(wanted * CHANNELS, dtype=np.float32)
         filled = 0
 
         while filled < wanted and not stop.is_set():
@@ -197,7 +257,7 @@ class _LaneReader:
         """Queue silence up to a timeline frame, exactly."""
         target = self.samples_at(frame)
         count = max(0, target - self._sample_pos)
-        self._pending = np.zeros(count * CHANNELS, dtype=np.int16)
+        self._pending = np.zeros(count * CHANNELS, dtype=np.float32)
         self._sample_pos = max(self._sample_pos, target)
 
     def _refill(self, stop: threading.Event) -> bool:
@@ -293,12 +353,43 @@ class _LaneReader:
             if data.size == 0:
                 continue
 
+            # Into float before anything is scaled: from here to the final cast
+            # there is no int16 to wrap around.
+            data = data.astype(np.float32)
             if segment.speed != 1.0:
                 data = self._retime(data, segment.speed)
 
+            produced = data.size // CHANNELS
+            data = self._shape(data, segment, produced)
+
             # Count exactly what was produced. Anything else drifts.
-            self._sample_pos += data.size // CHANNELS
+            self._sample_pos += produced
             return data
+
+    def _shape(self, data: np.ndarray, segment: Segment, produced: int) -> np.ndarray:
+        """Apply the clip's own gain and fades to a decoded block.
+
+        Called before `_sample_pos` advances, because at that moment it is
+        exactly the absolute position of this block's first sample — which is
+        the offset the envelope needs to continue a ramp across a block boundary
+        rather than restarting it.
+        """
+        if segment.gain == 1.0 and not segment.fade_in and not segment.fade_out:
+            return data
+
+        start = self.samples_at(segment.tl_start)
+        curve = envelope(
+            produced,
+            offset=self._sample_pos - start,
+            length=self.samples_at(segment.tl_end) - start,
+            fade_in=self.samples_at(segment.tl_start + segment.fade_in) - start,
+            fade_out=(
+                self.samples_at(segment.tl_end)
+                - self.samples_at(segment.tl_end - segment.fade_out)
+            ),
+            gain=segment.gain,
+        )
+        return (data.reshape(-1, CHANNELS) * curve[:, None]).reshape(-1)
 
     @staticmethod
     def _flatten(data: np.ndarray) -> np.ndarray:
@@ -336,6 +427,155 @@ class _LaneReader:
         return data.reshape(-1, CHANNELS)[picks].reshape(-1)
 
 
+class MixerState:
+    """Fader positions shared between the UI thread and the decode thread.
+
+    Lane and master gain are read live, once per mixed block, instead of being
+    baked into the playlist. A fader is a continuous control: rebuilding the
+    playlist and restarting the device on every pixel of a drag would stutter
+    twenty times a second. Clip gain and fades *are* baked in, because they are
+    part of the edit rather than a monitoring level.
+
+    One uncontended lock per block, holding a handful of floats.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._lanes: dict[str, float] = {}
+        self._master = 1.0
+
+    def set_lane(self, track_id: str, gain: float) -> None:
+        with self._lock:
+            self._lanes[track_id] = float(gain)
+
+    def set_master(self, gain: float) -> None:
+        with self._lock:
+            self._master = float(gain)
+
+    def load(self, timeline: Timeline) -> None:
+        """Resync from the model, which stays the source of truth."""
+        lanes = {track.track_id: from_db(track.gain_db) for track in timeline.audio_tracks}
+        master = from_db(timeline.master_gain_db)
+        with self._lock:
+            self._lanes = lanes
+            self._master = master
+
+    def snapshot(self) -> tuple[dict[str, float], float]:
+        with self._lock:
+            return dict(self._lanes), self._master
+
+
+@dataclass(frozen=True, slots=True)
+class MeterFrame:
+    """Peaks for one mixed block, stamped with where it lands in the output."""
+
+    sample: int                        # output sample-frame index of the first sample
+    count: int
+    lanes: dict[str, float] = field(default_factory=dict)     # post-fader, 0..1
+    lane_clipped: dict[str, bool] = field(default_factory=dict)
+    master: float = 0.0                # post-master peak, 0..1
+    master_clipped: bool = False
+
+
+def _merge_frames(frames: list[MeterFrame]) -> MeterFrame:
+    """Reduce several played blocks to one reading, taking the loudest of each."""
+    lanes: dict[str, float] = {}
+    clipped: dict[str, bool] = {}
+    master = 0.0
+    master_clipped = False
+    for frame in frames:
+        for track_id, peak in frame.lanes.items():
+            lanes[track_id] = max(lanes.get(track_id, 0.0), peak)
+        for track_id, flag in frame.lane_clipped.items():
+            clipped[track_id] = clipped.get(track_id, False) or flag
+        master = max(master, frame.master)
+        master_clipped = master_clipped or frame.master_clipped
+    first = frames[0]
+    last = frames[-1]
+    return MeterFrame(
+        sample=first.sample,
+        count=last.sample + last.count - first.sample,
+        lanes=lanes,
+        lane_clipped=clipped,
+        master=master,
+        master_clipped=master_clipped,
+    )
+
+
+class MeterQueue:
+    """Peaks measured in the decode thread, delivered when they are heard.
+
+    The decoder runs the better part of a second ahead of the device, so metering
+    what has just been decoded would show levels for audio nobody has heard yet:
+    the bars would visibly lead the playhead, which reads as the meters being
+    broken rather than as them being early.
+
+    The ring buffer is a strict FIFO, so the n-th sample-frame written is the
+    n-th played. Each block is therefore stamped with its position in the output
+    stream and held until the device reports having played past it.
+    """
+
+    def __init__(self, capacity: int = 96) -> None:      # about 4.8 s of blocks
+        self._lock = threading.Lock()
+        self._frames: collections.deque[MeterFrame] = collections.deque(maxlen=capacity)
+
+    def push(self, frame: MeterFrame) -> None:
+        with self._lock:
+            self._frames.append(frame)
+
+    def clear(self) -> None:
+        with self._lock:
+            self._frames.clear()
+
+    def drain(self, heard_samples: float) -> MeterFrame | None:
+        """Every block fully played by `heard_samples`, reduced to one reading.
+
+        `heard_samples` is passed in rather than read from the device here, which
+        keeps the whole compensation rule a pure function — testable offscreen
+        with no QAudioSink anywhere near it.
+
+        Reduced rather than returned one at a time because blocks arrive at 20 Hz
+        and the meters repaint at 30: taking the loudest of whatever played since
+        the last repaint shows a transient between two frames instead of skipping
+        it.
+        """
+        with self._lock:
+            taken: list[MeterFrame] = []
+            while self._frames and self._frames[0].sample + self._frames[0].count <= heard_samples:
+                taken.append(self._frames.popleft())
+        return _merge_frames(taken) if taken else None
+
+
+def _signature(playlists: list[Playlist]) -> tuple:
+    """A cheap identity for what the decoder would actually read.
+
+    Every edit emits `timeline_changed`, and the streamer used to stop and
+    restart the device for all of them — an audible gap for a video-only trim, a
+    selection change or a fader move. Comparing the reads themselves makes the
+    common case free.
+    """
+    return tuple(
+        (
+            playlist.track_id,
+            playlist.duration,
+            tuple(
+                (
+                    segment.tl_start,
+                    segment.tl_end,
+                    segment.path,
+                    segment.src_start,
+                    segment.speed,
+                    segment.gain,
+                    segment.fade_in,
+                    segment.fade_out,
+                )
+                for segment in playlist.segments
+            ),
+        )
+        for playlist in playlists
+    )
+
+
 class AudioStreamer:
     """Decodes the audio playlist into PCM and plays it through QAudioSink."""
 
@@ -354,12 +594,29 @@ class AudioStreamer:
         self._active = False
         self._silent = False        # true when the timeline has no audio at all
 
+        self.mixer = MixerState()
+        self.meters = MeterQueue()
+        # Sample-frames handed to the ring since start(). Shares its origin with
+        # QAudioSink.processedUSecs(), which is the whole basis of the meter's
+        # latency compensation.
+        self._out_samples = 0
+        self._signature: tuple | None = None
+
     # -- setup ------------------------------------------------------------------
 
     def set_playlists(self, playlists: list[Playlist], position: int) -> None:
+        signature = _signature(playlists)
+        if signature == self._signature:
+            # Nothing the decoder would read has changed, so the device is left
+            # alone. This is what makes a fader move, a selection change and a
+            # video-only trim silent instead of each costing a restart.
+            self._playlists = list(playlists)
+            return
+
         was_active = self._active
         self.stop()
         self._playlists = list(playlists)
+        self._signature = signature
         if was_active:
             self.start(position)
 
@@ -379,6 +636,11 @@ class AudioStreamer:
         )
 
     # -- transport --------------------------------------------------------------
+
+    @property
+    def active(self) -> bool:
+        """True when a device is open and will report a position to steer by."""
+        return self._active
 
     def start(self, frame: int) -> None:
         self.stop()
@@ -400,6 +662,10 @@ class AudioStreamer:
         self._silent = False
         self._stop.clear()
         self._ring.clear()
+        # Both counters restart with the device. Draining stale frames against a
+        # reset processedUSecs() would flash every meter at full scale.
+        self.meters.clear()
+        self._out_samples = 0
 
         self._thread = threading.Thread(target=self._run, name="vedit-audio", daemon=True)
         self._thread.start()
@@ -423,6 +689,7 @@ class AudioStreamer:
             self._thread.join(timeout=1.5)
             self._thread = None
         self._ring.clear()
+        self.meters.clear()
         self._active = False
 
     def shutdown(self) -> None:
@@ -430,8 +697,8 @@ class AudioStreamer:
 
     # -- clock ------------------------------------------------------------------
 
-    def clock_frame(self) -> float | None:
-        """Timeline frame the audio device has reached, or None if it is silent.
+    def _heard_seconds(self) -> float | None:
+        """Seconds of audio the listener has actually heard since `start()`.
 
         `processedUSecs()` is used rather than counting the bytes we hand over,
         because it is reported at the device's own granularity (about 21 ms)
@@ -440,7 +707,8 @@ class AudioStreamer:
         values instead of using them directly.
 
         The device's own buffer sits between "processed" and "heard", so that
-        latency is subtracted to keep picture aligned with sound.
+        latency is subtracted. One definition, used by both the clock and the
+        meters — they have to mean the same thing by "now".
         """
         if not self._active or self._sink is None:
             return None
@@ -448,9 +716,29 @@ class AudioStreamer:
         processed = self._sink.processedUSecs() / 1_000_000.0
         buffered_bytes = max(0, self._sink.bufferSize() - self._sink.bytesFree())
         latency = (buffered_bytes / BYTES_PER_FRAME) / SAMPLE_RATE
-        heard = max(0.0, processed - latency)
+        return max(0.0, processed - latency)
 
+    def clock_frame(self) -> float | None:
+        """Timeline frame the audio device has reached, or None if it is silent."""
+        heard = self._heard_seconds()
+        if heard is None:
+            return None
         return self._start_frame + heard * float(self.timebase.fps)
+
+    # -- metering ---------------------------------------------------------------
+
+    def meter_peaks(self) -> MeterFrame | None:
+        """Peaks for the audio being heard right now, or None if nothing new played.
+
+        The underrun padding is subtracted because it advanced the device's clock
+        without ever having been metered. Left in, a single hiccup would push the
+        meters permanently ahead of the sound, and the error would accumulate.
+        """
+        heard = self._heard_seconds()
+        if heard is None or self._device is None:
+            return None
+        padded = self._device.padded_bytes / BYTES_PER_FRAME
+        return self.meters.drain(heard * SAMPLE_RATE - padded)
 
     # -- the decode thread ------------------------------------------------------
 
@@ -462,11 +750,16 @@ class AudioStreamer:
         return bytes(int(seconds * SAMPLE_RATE) * BYTES_PER_FRAME)
 
     def _run(self) -> None:
-        """Pull an equal block from every lane, sum them, and hand it on.
+        """Pull an equal block from every lane, mix them, and hand it on.
 
-        Mixing in int32 before clipping back to int16 matters: summing two loud
+        Mixing in float32 and clipping once at the end matters: summing two loud
         lanes directly in int16 wraps around, which is heard as a loud crackle
-        rather than as distortion.
+        rather than as distortion, and clipping at each stage instead would
+        flatten a boosted clip three times over.
+
+        Peaks are measured post-fader per lane and post-master for the mix, and
+        stamped with where the block lands in the output so the meters can be
+        shown when the block is heard rather than when it is decoded.
         """
         readers = [
             _LaneReader(playlist, self.timebase, self._start_frame)
@@ -480,12 +773,24 @@ class AudioStreamer:
                     self._ring.set_eof()
                     return
 
-                mixed = np.zeros(block * CHANNELS, dtype=np.int32)
+                lanes, master = self.mixer.snapshot()
+                mixed = np.zeros(block * CHANNELS, dtype=np.float32)
+                lane_peaks: dict[str, float] = {}
+                lane_clipped: dict[str, bool] = {}
                 alive = False
+
                 for reader in readers:
                     if not reader.finished:
                         alive = True
-                    mixed += reader.read(block, self._stop)
+                    pcm = reader.read(block, self._stop)
+                    gain = lanes.get(reader.playlist.track_id, 1.0)
+                    if gain != 1.0:
+                        pcm = pcm * gain
+                    peak = float(np.max(np.abs(pcm))) if pcm.size else 0.0
+                    track_id = reader.playlist.track_id
+                    lane_peaks[track_id] = min(1.0, peak / 32768.0)
+                    lane_clipped[track_id] = peak >= 32767.0
+                    mixed += pcm
 
                 if self._stop.is_set():
                     return
@@ -493,7 +798,25 @@ class AudioStreamer:
                     self._ring.set_eof()
                     return
 
-                np.clip(mixed, -32768, 32767, out=mixed)
+                if master != 1.0:
+                    mixed *= master
+
+                # Measured before the clip, because that is the only moment an
+                # overload is still visible.
+                master_peak = float(np.max(np.abs(mixed))) if mixed.size else 0.0
+                self.meters.push(
+                    MeterFrame(
+                        sample=self._out_samples,
+                        count=block,
+                        lanes=lane_peaks,
+                        lane_clipped=lane_clipped,
+                        master=min(1.0, master_peak / 32768.0),
+                        master_clipped=master_peak > 32767.0,
+                    )
+                )
+                self._out_samples += block
+
+                np.clip(mixed, -32768.0, 32767.0, out=mixed)
                 if not self._ring.write(mixed.astype(np.int16).tobytes(), stop=self._stop):
                     return
         except Exception:  # noqa: BLE001 - a bad file silences audio, nothing worse

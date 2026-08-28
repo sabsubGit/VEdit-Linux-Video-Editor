@@ -20,7 +20,9 @@ from typing import Iterable, Literal, Sequence
 from vedit.core.timebase import TimeBase
 from vedit.media.probe import MediaInfo
 from vedit.timeline.model import (
+    MAX_GAIN_DB,
     MAX_SPEED,
+    MIN_GAIN_DB,
     MIN_SPEED,
     Clip,
     Timeline,
@@ -390,6 +392,10 @@ def trim(timeline: Timeline, clip: Clip, edge: Edge, new_frame: int) -> int:
             member.tl_start += delta
         else:
             member.src_out = min(member.src_length, member.src_out + source_delta)
+        # A trim can shorten a clip past its own fade. Left alone the fade would
+        # be longer than the clip it lives on and the playback envelope would run
+        # off the end of its own ramp.
+        member.clamp_fades()
 
     for track in timeline.tracks:
         track.sort()
@@ -498,6 +504,110 @@ def set_speed(timeline: Timeline, clips: Sequence[Clip], speed: float) -> None:
 
 def clip_speed(timeline: Timeline, clip: Clip) -> float:
     return clip.speed
+
+
+# -- levels -------------------------------------------------------------------
+
+
+def _audio_only(clips: Sequence[Clip]) -> list[Clip]:
+    """The audio members of a selection.
+
+    Gain and fades deliberately do *not* expand link groups the way a move does:
+    a video clip has no level, so applying a gain to a linked pair would either
+    do nothing to half of it or silently invent a meaning for it.
+    """
+    return [clip for clip in clips if clip.kind == "audio"]
+
+
+def set_clip_gain(timeline: Timeline, clips: Sequence[Clip], gain_db: float) -> list[Clip]:
+    """Set the level trim on the audio clips of a selection."""
+    targets = _audio_only(clips)
+    if not targets:
+        return []
+    _assert_unlocked(timeline, targets)
+
+    gain_db = max(MIN_GAIN_DB, min(MAX_GAIN_DB, float(gain_db)))
+    for clip in targets:
+        clip.gain_db = gain_db
+    return targets
+
+
+def normalise_clips(timeline: Timeline, clips: Sequence[Clip], gains: dict[str, float]) -> list[Clip]:
+    """Apply a precomputed per-clip gain, keyed by clip id.
+
+    The gains are measured by the caller rather than here: measuring needs the
+    peak files, which are a `ProxyManager` concern, and this module has no
+    business knowing where media lives.
+    """
+    targets = [clip for clip in _audio_only(clips) if clip.clip_id in gains]
+    if not targets:
+        return []
+    _assert_unlocked(timeline, targets)
+
+    for clip in targets:
+        clip.gain_db = max(MIN_GAIN_DB, min(MAX_GAIN_DB, float(gains[clip.clip_id])))
+    return targets
+
+
+def set_clip_fade(timeline: Timeline, clip: Clip, edge: Edge, frames: int) -> int:
+    """Set one fade on one clip. Returns the length actually set.
+
+    Clamps rather than raising, by the dragging convention: the fade handle stops
+    against the other fade instead of throwing when they meet.
+    """
+    if clip.kind != "audio":
+        return 0
+    _assert_unlocked(timeline, [clip])
+
+    other = clip.fade_out if edge == "in" else clip.fade_in
+    frames = max(0, min(int(frames), clip.duration - other))
+    if edge == "in":
+        clip.fade_in = frames
+    else:
+        clip.fade_out = frames
+    return frames
+
+
+def clear_clip_fades(timeline: Timeline, clips: Sequence[Clip]) -> list[Clip]:
+    targets = _audio_only(clips)
+    if not targets:
+        return []
+    _assert_unlocked(timeline, targets)
+
+    for clip in targets:
+        clip.fade_in = 0
+        clip.fade_out = 0
+    return targets
+
+
+def set_track_gain(timeline: Timeline, track: Track, gain_db: float) -> float:
+    """Set a lane's fader position. Not blocked by a lock: locking a track
+    protects its edit, not its monitoring level."""
+    track.gain_db = max(MIN_GAIN_DB, min(MAX_GAIN_DB, float(gain_db)))
+    return track.gain_db
+
+
+def set_track_muted(timeline: Timeline, track: Track, muted: bool) -> None:
+    track.muted = bool(muted)
+
+
+def set_track_locked(timeline: Timeline, track: Track, locked: bool) -> None:
+    track.locked = bool(locked)
+
+
+def set_track_solo(timeline: Timeline, track: Track, solo: bool) -> None:
+    track.solo = bool(solo)
+
+
+def clear_solos(timeline: Timeline) -> None:
+    """Drop every solo — what Alt-clicking a solo button does."""
+    for track in timeline.audio_tracks:
+        track.solo = False
+
+
+def set_master_gain(timeline: Timeline, gain_db: float) -> float:
+    timeline.master_gain_db = max(MIN_GAIN_DB, min(MAX_GAIN_DB, float(gain_db)))
+    return timeline.master_gain_db
 
 
 # -- tracks -------------------------------------------------------------------

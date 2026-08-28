@@ -20,7 +20,13 @@ from vedit.core.timebase import TimeBase
 from vedit.media.probe import MediaInfo, UnsupportedMedia, probe
 from vedit.timeline.model import Clip, Timeline, Track  # noqa: F401
 
-FORMAT_VERSION = 1
+# Version 2 added mixing: per-clip gain and fades, per-track gain and solo, and
+# a master gain. Every one of them defaults to "as it was", so a version 1 file
+# loads unchanged — the bump exists for the other direction. `load_project`
+# refuses anything newer than it understands, and without the bump an older
+# build would open a v2 project, silently drop every gain and fade, and write
+# them away on the next save.
+FORMAT_VERSION = 2
 SUFFIX = ".vedit"
 
 
@@ -51,6 +57,9 @@ def _clip_to_dict(clip: Clip) -> dict:
         "link_id": clip.link_id,
         "name": clip.name,
         "enabled": clip.enabled,
+        "gain_db": clip.gain_db,
+        "fade_in": clip.fade_in,
+        "fade_out": clip.fade_out,
     }
 
 
@@ -65,6 +74,7 @@ def project_to_dict(timeline: Timeline, media: list[MediaInfo], playhead: int = 
         "width": timeline.width,
         "height": timeline.height,
         "sample_rate": timeline.sample_rate,
+        "master_gain_db": timeline.master_gain_db,
         "playhead": playhead,
         # Only media actually used on the timeline is written; an unused pool
         # entry is a UI convenience, not part of the edit.
@@ -78,6 +88,8 @@ def project_to_dict(timeline: Timeline, media: list[MediaInfo], playhead: int = 
                 "name": track.name,
                 "muted": track.muted,
                 "locked": track.locked,
+                "gain_db": track.gain_db,
+                "solo": track.solo,
                 "clips": [_clip_to_dict(clip) for clip in track.clips],
             }
             for track in timeline.tracks
@@ -131,6 +143,7 @@ def load_project(path: Path) -> LoadResult:
         height=int(payload.get("height", 1080)),
         sample_rate=int(payload.get("sample_rate", 48000)),
         tracks=[],
+        master_gain_db=float(payload.get("master_gain_db", 0.0)),
     )
 
     # Re-probe rather than trusting stored metadata: the file on disk is the
@@ -160,6 +173,8 @@ def load_project(path: Path) -> LoadResult:
             name=raw_track.get("name", kind[0].upper() + "1"),
             muted=bool(raw_track.get("muted", False)),
             locked=bool(raw_track.get("locked", False)),
+            gain_db=float(raw_track.get("gain_db", 0.0)),
+            solo=bool(raw_track.get("solo", False)),
         )
         for raw_clip in raw_track.get("clips", []):
             media_id = raw_clip.get("media_id", "")
@@ -178,6 +193,9 @@ def load_project(path: Path) -> LoadResult:
                         link_id=raw_clip.get("link_id"),
                         name=raw_clip.get("name", ""),
                         enabled=bool(raw_clip.get("enabled", True)),
+                        gain_db=float(raw_clip.get("gain_db", 0.0)),
+                        fade_in=int(raw_clip.get("fade_in", 0)),
+                        fade_out=int(raw_clip.get("fade_out", 0)),
                     )
                 )
             except (KeyError, ValueError, TypeError):

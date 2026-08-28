@@ -10,13 +10,29 @@ from __future__ import annotations
 
 import subprocess
 import time
+from pathlib import Path
 from fractions import Fraction
 
 import pytest
 
+import numpy as np
+
 from vedit.core.timebase import TimeBase
-from vedit.player.clock import CORRECTION_GAIN, SNAP_THRESHOLD_FRAMES, MasterClock
+from vedit.player.audio import (
+    MeterFrame,
+    MeterQueue,
+    MixerState,
+    _signature,
+    envelope,
+)
+from vedit.player.clock import (
+    CORRECTION_GAIN,
+    HOLD_TIMEOUT_SECONDS,
+    SNAP_THRESHOLD_FRAMES,
+    MasterClock,
+)
 from vedit.player.segments import Playlist, Segment, build_playlist
+from vedit.timeline.model import Timeline
 
 
 class TestMasterClock:
@@ -88,6 +104,59 @@ class TestMasterClock:
         target = SNAP_THRESHOLD_FRAMES + 50
         clock.discipline(target)
         assert clock.position() == pytest.approx(target, abs=1.0)
+
+    def test_waiting_for_audio_holds_instead_of_running_ahead(self):
+        """The lurch-backwards bug: a device takes a moment to make its first
+        sound, and the clock must not cover that ground and be dragged back."""
+        clock = MasterClock(TimeBase(30))
+        clock.start(100, wait_for_audio=True)
+        time.sleep(0.15)
+        # The device is open but still filling its buffer: it keeps reporting the
+        # frame we started on.
+        clock.discipline(100.0)
+        assert clock.position() == 100.0, "must not advance before the sound does"
+
+        # First real progress: the clock takes it and runs on from there.
+        clock.discipline(100.5)
+        first = clock.position()
+        assert first == pytest.approx(100.5, abs=0.2)
+        time.sleep(0.05)
+        assert clock.position() > first
+
+    def test_waiting_never_moves_backwards(self):
+        clock = MasterClock(TimeBase(30))
+        clock.start(100, wait_for_audio=True)
+        readings = []
+        for i in range(30):
+            clock.discipline(100.0 if i < 15 else 100.0 + (i - 14) * 0.5)
+            readings.append(clock.position())
+            time.sleep(0.005)
+        assert readings == sorted(readings), "the playhead must never go back"
+
+    def test_hold_times_out_if_the_device_never_speaks(self):
+        clock = MasterClock(TimeBase(30))
+        clock.start(0, wait_for_audio=True)
+        clock.discipline(None)
+        assert clock.position() == 0.0
+        time.sleep(HOLD_TIMEOUT_SECONDS + 0.05)
+        clock.discipline(None)
+        assert clock.position() > 0.0, "a dead device must not freeze the playhead"
+
+    def test_not_waiting_starts_immediately(self):
+        clock = MasterClock(TimeBase(30))
+        clock.start(0)
+        time.sleep(0.1)
+        assert clock.position() > 0.0
+
+    def test_reset_can_wait_for_the_device_too(self):
+        """A seek mid-playback restarts the sink, so it needs the same wait."""
+        clock = MasterClock(TimeBase(30))
+        clock.start(0)
+        clock.reset(500, wait_for_audio=True)
+        time.sleep(0.1)
+        assert clock.position() == 500.0
+        clock.discipline(501.0)
+        assert clock.position() == pytest.approx(501.0, abs=0.2)
 
     def test_no_audio_leaves_the_clock_free_running(self):
         clock = MasterClock(TimeBase(30))
@@ -322,3 +391,199 @@ class TestFrameConversion:
             container.close()
         gc.collect()
         assert image.pixelColor(10, 10).isValid()
+
+
+class TestEnvelope:
+    """The fade curve. Pure numpy, no device and no file.
+
+    The mid-fade test is the one that matters: blocks arrive about 50 ms at a
+    time, so a two-second fade is spread over forty of them and a curve derived
+    from the position within a block would restart the ramp forty times.
+    """
+
+    def test_no_fades_is_a_flat_gain(self):
+        curve = envelope(64, offset=0, length=1000, fade_in=0, fade_out=0, gain=0.5)
+        assert curve.shape == (64,)
+        assert np.allclose(curve, 0.5)
+
+    def test_a_fade_in_ramps_from_zero_to_one(self):
+        curve = envelope(100, offset=0, length=1000, fade_in=100, fade_out=0, gain=1.0)
+        assert curve[0] == pytest.approx(0.0)
+        assert curve[50] == pytest.approx(0.5)
+        assert curve[-1] == pytest.approx(0.99)
+
+    def test_a_block_starting_mid_fade_continues_the_ramp(self):
+        curve = envelope(500, offset=1000, length=100_000, fade_in=4000, fade_out=0, gain=1.0)
+        assert curve[0] == pytest.approx(0.25)
+        assert curve[-1] == pytest.approx(1499 / 4000)
+
+    def test_a_block_past_the_fade_is_flat(self):
+        curve = envelope(64, offset=9000, length=100_000, fade_in=4000, fade_out=0, gain=1.0)
+        assert np.allclose(curve, 1.0)
+
+    def test_a_fade_out_falls_to_zero_at_the_end(self):
+        curve = envelope(100, offset=900, length=1000, fade_in=0, fade_out=100, gain=1.0)
+        assert curve[0] == pytest.approx(1.0)
+        assert curve[-1] == pytest.approx(0.01)
+
+    def test_overlapping_fades_take_the_quieter_of_the_two(self):
+        curve = envelope(100, offset=0, length=100, fade_in=60, fade_out=60, gain=1.0)
+        assert curve.max() < 1.0
+        assert curve[0] == pytest.approx(0.0)
+        assert curve[-1] == pytest.approx(1 / 60, abs=1e-6)
+
+    def test_gain_scales_the_whole_curve(self):
+        plain = envelope(50, offset=0, length=1000, fade_in=100, fade_out=0, gain=1.0)
+        loud = envelope(50, offset=0, length=1000, fade_in=100, fade_out=0, gain=2.0)
+        assert np.allclose(loud, plain * 2.0)
+
+    def test_never_goes_negative_past_the_end(self):
+        """A clip trimmed shorter than its fade would otherwise invert the audio."""
+        curve = envelope(200, offset=950, length=1000, fade_in=0, fade_out=100, gain=1.0)
+        assert curve.min() >= 0.0
+
+    def test_returns_float32(self):
+        curve = envelope(16, offset=0, length=100, fade_in=8, fade_out=0, gain=1.0)
+        assert curve.dtype == np.float32
+
+
+def meter_frame(sample, count, *, master=0.0, lanes=None, clipped=False):
+    return MeterFrame(
+        sample=sample,
+        count=count,
+        lanes=lanes or {},
+        lane_clipped={},
+        master=master,
+        master_clipped=clipped,
+    )
+
+
+class TestMeterQueue:
+    """Latency compensation for the meters.
+
+    `drain` takes the heard position as an argument rather than reading the
+    device, which is what makes all of this testable with no QAudioSink in the
+    process at all.
+    """
+
+    def test_a_block_is_held_until_it_has_fully_played(self):
+        queue = MeterQueue()
+        queue.push(meter_frame(0, 2400, master=0.5))
+        assert queue.drain(0) is None
+        assert queue.drain(2399) is None
+        assert queue.drain(2400) is not None
+
+    def test_a_drained_block_is_not_returned_twice(self):
+        queue = MeterQueue()
+        queue.push(meter_frame(0, 2400, master=0.5))
+        assert queue.drain(5000) is not None
+        assert queue.drain(5000) is None
+
+    def test_several_blocks_reduce_to_the_loudest(self):
+        queue = MeterQueue()
+        queue.push(meter_frame(0, 100, master=0.2, lanes={"t1": 0.2}))
+        queue.push(meter_frame(100, 100, master=0.9, lanes={"t1": 0.9}))
+        queue.push(meter_frame(200, 100, master=0.4, lanes={"t1": 0.4}))
+        merged = queue.drain(300)
+        assert merged.master == pytest.approx(0.9)
+        assert merged.lanes["t1"] == pytest.approx(0.9)
+
+    def test_a_clip_flag_survives_the_merge(self):
+        queue = MeterQueue()
+        queue.push(meter_frame(0, 100))
+        queue.push(meter_frame(100, 100, clipped=True))
+        assert queue.drain(200).master_clipped is True
+
+    def test_lanes_that_appear_in_only_some_blocks_are_kept(self):
+        queue = MeterQueue()
+        queue.push(meter_frame(0, 100, lanes={"t1": 0.3}))
+        queue.push(meter_frame(100, 100, lanes={"t2": 0.7}))
+        merged = queue.drain(200)
+        assert merged.lanes == {"t1": pytest.approx(0.3), "t2": pytest.approx(0.7)}
+
+    def test_only_played_blocks_are_taken(self):
+        queue = MeterQueue()
+        queue.push(meter_frame(0, 100, master=0.2))
+        queue.push(meter_frame(100, 100, master=0.9))
+        assert queue.drain(100).master == pytest.approx(0.2)
+        assert queue.drain(200).master == pytest.approx(0.9)
+
+    def test_clear_empties_it(self):
+        queue = MeterQueue()
+        queue.push(meter_frame(0, 100))
+        queue.clear()
+        assert queue.drain(10_000) is None
+
+    def test_the_oldest_frames_are_dropped_when_it_overflows(self):
+        queue = MeterQueue(capacity=4)
+        for index in range(8):
+            queue.push(meter_frame(index * 100, 100, master=index / 10))
+        merged = queue.drain(10_000)
+        assert merged.sample == 400, "the first four blocks were discarded"
+
+    def test_the_underrun_padding_correction_holds_a_block_back(self):
+        """Silence handed back on an underrun advances the device's clock but was
+        never metered. Without discounting it the meters run permanently ahead of
+        the sound, and the error accumulates with every hiccup."""
+        queue = MeterQueue()
+        queue.push(meter_frame(0, 2400, master=0.5))
+        heard, padded = 2400.0, 1000.0
+        assert queue.drain(heard) is not None
+
+        queue.push(meter_frame(2400, 2400, master=0.5))
+        assert queue.drain(4800 - padded) is None, "padding must not release it early"
+        assert queue.drain(4800) is not None
+
+
+class TestMixerState:
+    def test_lanes_and_master_default_to_unity(self):
+        state = MixerState()
+        lanes, master = state.snapshot()
+        assert lanes == {} and master == 1.0
+
+    def test_set_lane_is_visible_in_the_snapshot(self):
+        state = MixerState()
+        state.set_lane("t1", 0.5)
+        assert state.snapshot()[0]["t1"] == 0.5
+
+    def test_load_converts_the_model_from_db(self):
+        timeline = Timeline.default(TimeBase(30))
+        timeline.audio_tracks[0].gain_db = -6.0
+        timeline.master_gain_db = 6.0
+        state = MixerState()
+        state.load(timeline)
+        lanes, master = state.snapshot()
+        assert lanes[timeline.audio_tracks[0].track_id] == pytest.approx(0.501187, abs=1e-5)
+        assert master == pytest.approx(1.995262, abs=1e-5)
+
+    def test_a_snapshot_is_a_copy(self):
+        state = MixerState()
+        state.set_lane("t1", 0.5)
+        lanes, _ = state.snapshot()
+        lanes["t1"] = 99.0
+        assert state.snapshot()[0]["t1"] == 0.5
+
+
+class TestPlaylistSignature:
+    """The guard on "moving a fader does not restart the device"."""
+
+    def make(self, *, gain=1.0, fade_in=0):
+        segment = Segment(0, 100, Path("/a.mp4"), 0, "m1", 1.0, "c1", gain, fade_in, 0)
+        return [Playlist([segment], 100, "t1")]
+
+    def test_identical_playlists_match(self):
+        assert _signature(self.make()) == _signature(self.make())
+
+    def test_a_clip_gain_change_is_visible(self):
+        assert _signature(self.make()) != _signature(self.make(gain=0.5))
+
+    def test_a_fade_change_is_visible(self):
+        assert _signature(self.make()) != _signature(self.make(fade_in=30))
+
+    def test_a_track_gain_change_is_not(self):
+        """Lane gain is read live by the mixer, so it never reaches the playlist
+        and must never cost a restart."""
+        timeline = Timeline.default(TimeBase(30))
+        before = _signature(self.make())
+        timeline.audio_tracks[0].gain_db = -6.0
+        assert _signature(self.make()) == before
