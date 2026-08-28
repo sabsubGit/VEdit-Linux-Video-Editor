@@ -82,7 +82,8 @@ segment is normalised before concatenation.
 | `Ctrl+S` / `Ctrl+O` | Save / open project |
 | `Shift+1/2/3` | Media / Edit / Render page |
 
-Mouse: drag a clip body to move it, drag its edges to trim, `Ctrl`+wheel to zoom,
+Mouse: drag a clip body to move it along the timeline or up and down onto
+another lane, drag its edges to trim, `Ctrl`+wheel to zoom,
 wheel to scroll lanes, `Shift`+wheel to scroll along the timeline. Click a track
 header to mute it, `Shift`-click to lock it.
 

@@ -16,7 +16,16 @@ from dataclasses import dataclass
 from enum import Enum, auto
 
 from PySide6.QtCore import QPoint, QRectF, Qt, Signal
-from PySide6.QtGui import QBrush, QColor, QFont, QFontMetrics, QPainter, QPen, QPolygon
+from PySide6.QtGui import (
+    QBrush,
+    QColor,
+    QFont,
+    QFontMetrics,
+    QPainter,
+    QPainterPath,
+    QPen,
+    QPolygon,
+)
 from PySide6.QtWidgets import QHBoxLayout, QMenu, QScrollBar, QVBoxLayout, QWidget
 
 from vedit import theme
@@ -85,6 +94,8 @@ class TimelineCanvas(QWidget):
         self._drag_clips: list[Clip] = []
         self._drag_delta = 0
         self._drag_track: Track | None = None
+        self._drag_target: Track | None = None   # lane the drag would land on
+        self._drag_kind: str = "video"
         self._trim_clip: Clip | None = None
         self._trim_edge: str = "out"
         self._trim_frame = 0
@@ -173,8 +184,14 @@ class TimelineCanvas(QWidget):
         return None
 
     def clip_rect(self, clip: Clip, top: int, height: int) -> QRectF:
-        left = self.x_of(clip.tl_start)
-        right = self.x_of(clip.tl_end)
+        """Clip body rounded to whole pixels.
+
+        Landing the edges on pixel boundaries keeps the straight sides sharp
+        once antialiasing is on, so only the corner arcs get softened — a
+        fractional left edge would blur the whole side instead.
+        """
+        left = round(self.x_of(clip.tl_start))
+        right = round(self.x_of(clip.tl_end))
         return QRectF(left, top + 1, max(right - left, 1.0), height - 2)
 
     # -- hit testing -----------------------------------------------------------
@@ -253,6 +270,7 @@ class TimelineCanvas(QWidget):
         painter.setClipRect(0, RULER_HEIGHT, self.width(), self.height() - RULER_HEIGHT)
         self._paint_lanes(painter)
         self._paint_clips(painter)
+        self._paint_lane_change(painter)
         self._paint_drop_indicator(painter)
         self._paint_snap_line(painter)
         self._paint_headers(painter)
@@ -357,6 +375,15 @@ class TimelineCanvas(QWidget):
 
                 # Reflect an in-progress drag without having touched the model.
                 if self._mode is Mode.MOVE and clip.clip_id in dragging:
+                    moved_lane = (
+                        self._drag_target is not None
+                        and self._drag_target is not track
+                        and clip.kind == self._drag_kind
+                    )
+                    if moved_lane:
+                        # Drawn on the destination lane, so the drop target is
+                        # obvious before the mouse is released.
+                        continue
                     rect = rect.translated(self._drag_delta * self.px_per_frame, 0)
                     ghost = True
                 elif self._mode is Mode.TRIM and self._trim_clip is not None:
@@ -376,16 +403,20 @@ class TimelineCanvas(QWidget):
                     fill = QColor(fill)
                     fill.setAlpha(190)
 
+                painter.setRenderHint(QPainter.Antialiasing, True)
                 painter.setPen(Qt.NoPen)
                 painter.setBrush(QBrush(fill))
                 painter.drawRoundedRect(rect, CLIP_RADIUS, CLIP_RADIUS)
+                painter.setRenderHint(QPainter.Antialiasing, False)
 
                 if clip.kind == "audio" and rect.width() > 4:
                     self._paint_waveform(painter, clip, rect)
 
+                painter.setRenderHint(QPainter.Antialiasing, True)
                 painter.setPen(QPen(border, 2 if is_selected else 1))
                 painter.setBrush(Qt.NoBrush)
                 painter.drawRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), CLIP_RADIUS, CLIP_RADIUS)
+                painter.setRenderHint(QPainter.Antialiasing, False)
 
                 if rect.width() > 34:
                     label = metrics.elidedText(
@@ -394,12 +425,60 @@ class TimelineCanvas(QWidget):
                     painter.setPen(QColor(255, 255, 255, 225))
                     painter.drawText(int(rect.left()) + 5, int(rect.top()) + 14, label)
 
+    def _paint_lane_change(self, painter: QPainter) -> None:
+        """Draw clips that are being dragged onto a different lane."""
+        target = self._drag_target
+        if self._mode is not Mode.MOVE or target is None or target is self._drag_track:
+            return
+
+        rows = {track.track_id: (top, height) for track, top, height in self.track_rows()}
+        geometry = rows.get(target.track_id)
+        if geometry is None:
+            return
+        top, height = geometry
+
+        # Tint the destination lane so it reads as the drop target.
+        highlight = QColor(theme.ACCENT)
+        highlight.setAlpha(28)
+        painter.fillRect(HEADER_WIDTH, top, self.width() - HEADER_WIDTH, height, highlight)
+
+        metrics = QFontMetrics(self.font())
+        for clip in self._drag_clips:
+            if clip.kind != self._drag_kind:
+                continue
+            rect = self.clip_rect(clip, top, height).translated(
+                self._drag_delta * self.px_per_frame, 0
+            )
+            if rect.width() < 1:
+                continue
+
+            fill, border = self._clip_colours(clip, True)
+            fill = QColor(fill)
+            fill.setAlpha(190)
+
+            painter.setRenderHint(QPainter.Antialiasing, True)
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(QBrush(fill))
+            painter.drawRoundedRect(rect, CLIP_RADIUS, CLIP_RADIUS)
+            painter.setPen(QPen(theme.ACCENT, 2))
+            painter.setBrush(Qt.NoBrush)
+            painter.drawRoundedRect(rect.adjusted(0.5, 0.5, -0.5, -0.5), CLIP_RADIUS, CLIP_RADIUS)
+            painter.setRenderHint(QPainter.Antialiasing, False)
+
+            if rect.width() > 34:
+                label = metrics.elidedText(clip.name or "clip", Qt.ElideMiddle, int(rect.width()) - 10)
+                painter.setPen(QColor(255, 255, 255, 225))
+                painter.drawText(int(rect.left()) + 5, int(rect.top()) + 14, label)
+
     def _paint_waveform(self, painter: QPainter, clip: Clip, rect: QRectF) -> None:
         peaks = self.waveforms.get(clip.media_id, self.project.proxies.peaks_for(clip.media_id))
         if peaks is None:
             return
         painter.save()
-        painter.setClipRect(rect)
+        # Clip to the rounded body, so the waveform cannot square off the corners.
+        path = QPainterPath()
+        path.addRoundedRect(rect, CLIP_RADIUS, CLIP_RADIUS)
+        painter.setClipPath(path)
         draw_waveform(
             painter,
             rect.adjusted(1, 15, -1, -3),
@@ -478,6 +557,8 @@ class TimelineCanvas(QWidget):
             self._drag_delta = 0
             self._drag_clips = ops.expand_links(self.timeline, self.project.selected_clips())
             self._drag_track = hit.track
+            self._drag_target = hit.track
+            self._drag_kind = hit.clip.kind
         else:
             self._mode = Mode.TRIM
             self._trim_clip = hit.clip
@@ -507,6 +588,7 @@ class TimelineCanvas(QWidget):
             snapped, target = self._snap(earliest + raw, moving, extra_edges=widths)
             self._drag_delta = snapped - earliest
             self._snap_line = target
+            self._drag_target = self._lane_under(pos.y())
             self.update()
             return
 
@@ -523,14 +605,19 @@ class TimelineCanvas(QWidget):
         mode, self._mode = self._mode, Mode.IDLE
         self._snap_line = None
 
-        if mode is Mode.MOVE and self._drag_clips and self._drag_delta != 0:
+        if mode is Mode.MOVE and self._drag_clips:
             clips, delta = list(self._drag_clips), self._drag_delta
-            try:
-                self.project.edit(
-                    "Move clip", lambda t: ops.move_clips(t, clips, delta)
-                )
-            except TimelineError as exc:
-                self.status_message.emit(str(exc))
+            target = self._drag_target
+            changed_lane = target is not None and target is not self._drag_track
+            if delta != 0 or changed_lane:
+                label = "Move clip to " + target.name if changed_lane else "Move clip"
+                try:
+                    self.project.edit(
+                        label,
+                        lambda t: ops.move_clips(t, clips, delta, target_track=target),
+                    )
+                except TimelineError as exc:
+                    self.status_message.emit(str(exc))
         elif mode is Mode.TRIM and self._trim_clip is not None:
             clip, edge, frame = self._trim_clip, self._trim_edge, self._trim_frame
             anchor = clip.tl_start if edge == "in" else clip.tl_end
@@ -541,8 +628,26 @@ class TimelineCanvas(QWidget):
 
         self._drag_clips = []
         self._drag_delta = 0
+        self._drag_target = None
+        self._drag_track = None
         self._trim_clip = None
         self.update()
+
+    def _lane_under(self, y: int) -> Track | None:
+        """The lane a vertical drag would drop onto.
+
+        Only lanes of the grabbed clip's own kind count, so dragging video over
+        the audio lanes keeps it on its current video lane rather than silently
+        refusing the whole move. A linked partner stays on its own lane and just
+        follows horizontally.
+        """
+        row = self.track_at(y)
+        if row is None:
+            return self._drag_track
+        track = row[0]
+        if track.kind != self._drag_kind or track.locked:
+            return self._drag_track
+        return track
 
     def _update_cursor(self, pos: QPoint) -> None:
         if pos.x() < HEADER_WIDTH or pos.y() < RULER_HEIGHT:

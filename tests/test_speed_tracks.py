@@ -145,3 +145,61 @@ class TestTrackManagement:
     def test_video_priority_is_lane_order(self, timeline):
         assert timeline.video_priority(timeline.video_tracks[0]) == 0
         assert timeline.video_priority(timeline.video_tracks[2]) == 2
+
+
+class TestCrossLaneMoves:
+    """Dragging a clip to another lane.
+
+    The grabbed clip changes lane; its linked partner keeps its own lane and
+    only follows horizontally. Moving the partner too would need a matching lane
+    to exist on the other side, which it often does not.
+    """
+
+    def test_video_changes_lane_and_audio_stays(self, timeline):
+        for kind in ("video", "audio"):
+            timeline.lane_for(kind).insert(clip(0, 100, kind=kind, link="L"))
+        video = timeline.video_tracks[0].clips[0]
+
+        ops.move_clips(timeline, [video], 0, target_track=timeline.video_tracks[1])
+
+        assert len(timeline.video_tracks[0].clips) == 0
+        assert len(timeline.video_tracks[1].clips) == 1
+        assert len(timeline.audio_tracks[0].clips) == 1, "audio kept its own lane"
+        assert timeline.audio_tracks[0].clips[0].tl_start == 0
+
+    def test_lane_change_and_time_shift_together(self, timeline):
+        c = clip(0, 100)
+        timeline.video_tracks[0].insert(c)
+        ops.move_clips(timeline, [c], 200, target_track=timeline.video_tracks[2])
+        assert timeline.video_tracks[2].clips[0].tl_start == 200
+
+    def test_audio_partner_follows_horizontally(self, timeline):
+        for kind in ("video", "audio"):
+            timeline.lane_for(kind).insert(clip(0, 100, kind=kind, link="L"))
+        video = timeline.video_tracks[0].clips[0]
+        ops.move_clips(timeline, [video], 50, target_track=timeline.video_tracks[1])
+        assert timeline.audio_tracks[0].clips[0].tl_start == 50, "sound stayed in sync"
+
+    def test_a_mismatched_target_kind_is_ignored(self, timeline):
+        c = clip(0, 100)
+        timeline.video_tracks[0].insert(c)
+        # An audio lane is not a legal home for a video clip; it moves in time only.
+        ops.move_clips(timeline, [c], 30, target_track=timeline.audio_tracks[0])
+        assert len(timeline.video_tracks[0].clips) == 1
+        assert timeline.video_tracks[0].clips[0].tl_start == 30
+
+    def test_occupied_destination_is_refused(self, timeline):
+        first = clip(0, 100)
+        blocker = clip(0, 100)
+        timeline.video_tracks[0].insert(first)
+        timeline.video_tracks[1].insert(blocker)
+        with pytest.raises(TimelineError, match="in the way"):
+            ops.move_clips(timeline, [first], 0, target_track=timeline.video_tracks[1])
+        assert len(timeline.video_tracks[0].clips) == 1, "rolled back"
+
+    def test_locked_destination_is_refused(self, timeline):
+        c = clip(0, 100)
+        timeline.video_tracks[0].insert(c)
+        timeline.video_tracks[1].locked = True
+        with pytest.raises(TimelineError, match="locked"):
+            ops.move_clips(timeline, [c], 0, target_track=timeline.video_tracks[1])
