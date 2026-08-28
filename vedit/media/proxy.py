@@ -13,6 +13,7 @@ between scrubbing that feels live and scrubbing that feels broken.
 
 from __future__ import annotations
 
+import json
 import os
 import struct
 import subprocess
@@ -29,6 +30,15 @@ PROXY_HEIGHT = 540
 PEAKS_RATE = 8000          # Hz the waveform pass decodes at
 PEAKS_PER_SECOND = 100     # min/max buckets stored per second
 PEAKS_MAGIC = b"VEPK\x01"
+
+# Filmstrip: periodic frames tiled into one sprite sheet, drawn along video
+# clips so a lane can be read at a glance. One sheet rather than many files
+# means one decode and one texture, which matters when the timeline repaints
+# on every frame during playback.
+FILMSTRIP_HEIGHT = 54      # cell height in pixels; a video lane is 70 tall
+FILMSTRIP_COLUMNS = 20
+FILMSTRIP_MAX_CELLS = 300  # caps sheet size and generation time on long media
+FILMSTRIP_MIN_CELLS = 8
 
 
 def cache_root() -> Path:
@@ -48,6 +58,8 @@ class CachePaths:
     proxy: Path
     peaks: Path
     thumb: Path
+    strip: Path
+    strip_meta: Path
 
     @classmethod
     def for_id(cls, media_id: str) -> CachePaths:
@@ -56,7 +68,28 @@ class CachePaths:
             proxy=root / "proxies" / f"{media_id}.mp4",
             peaks=root / "peaks" / f"{media_id}.peaks",
             thumb=root / "thumbs" / f"{media_id}.jpg",
+            strip=root / "strips" / f"{media_id}.jpg",
+            strip_meta=root / "strips" / f"{media_id}.json",
         )
+
+
+def filmstrip_plan(duration: float, aspect: float) -> dict:
+    """Work out the sheet layout for a clip of this length.
+
+    One cell per second, clamped: short clips still get enough frames to read,
+    and a two-hour source does not try to make seven thousand of them.
+    """
+    count = max(FILMSTRIP_MIN_CELLS, min(FILMSTRIP_MAX_CELLS, round(duration)))
+    interval = duration / count if count else 1.0
+    cell_width = max(2, int(round(FILMSTRIP_HEIGHT * aspect)))
+    cell_width += cell_width % 2                     # even, for the scaler
+    return {
+        "count": count,
+        "interval": interval,
+        "cell_width": cell_width,
+        "cell_height": FILMSTRIP_HEIGHT,
+        "columns": FILMSTRIP_COLUMNS,
+    }
 
 
 def _proxy_video_encoder() -> list[str]:
@@ -103,6 +136,7 @@ class _Signals(QObject):
     thumb_ready = Signal(str, str)   # media_id, path
     peaks_ready = Signal(str, str)
     proxy_ready = Signal(str, str)
+    strip_ready = Signal(str, str)
     failed = Signal(str, str)        # media_id, message
     progress = Signal(str, float)    # media_id, 0..1
 
@@ -204,6 +238,44 @@ class _IngestJob(QRunnable):
         if not self._cancelled and self.paths.proxy.exists():
             self.signals.proxy_ready.emit(self.info.media_id, str(self.paths.proxy))
 
+    def _make_filmstrip(self) -> None:
+        """Tile periodic frames into one sprite sheet for the timeline.
+
+        Runs last and reads the proxy when there is one: pulling 300 frames
+        through a 540p short-GOP file is far cheaper than decoding the original,
+        and the result is only ever drawn ~54 pixels tall.
+        """
+        if self.info.video is None or self.paths.strip.exists():
+            return
+        duration = float(self.info.duration)
+        if duration <= 0:
+            return
+
+        width, height = self.info.video.display_size
+        plan = filmstrip_plan(duration, width / height if height else 16 / 9)
+        source = self.paths.proxy if self.paths.proxy.exists() else self.info.path
+        rows = max(1, -(-plan["count"] // plan["columns"]))
+
+        self._run(
+            [
+                "-i", str(source),
+                "-vf", (
+                    f"fps=1/{plan['interval']:.6f},"
+                    f"scale={plan['cell_width']}:{plan['cell_height']},"
+                    f"tile={plan['columns']}x{rows}:padding=0"
+                ),
+                "-frames:v", "1",
+                "-q:v", "4",
+            ],
+            output=self.paths.strip,
+        )
+
+        if self._cancelled or not self.paths.strip.exists():
+            return
+        # The sheet alone does not say how to index it; store the layout beside it.
+        self.paths.strip_meta.write_text(json.dumps({**plan, "rows": rows}))
+        self.signals.strip_ready.emit(self.info.media_id, str(self.paths.strip))
+
     def _make_peaks(self) -> None:
         if self.info.audio is None or self.paths.peaks.exists():
             return
@@ -254,6 +326,8 @@ class _IngestJob(QRunnable):
             self._make_peaks()
             self.signals.progress.emit(media_id, 0.35)
             self._make_proxy()
+            self.signals.progress.emit(media_id, 0.85)
+            self._make_filmstrip()
             self.signals.progress.emit(media_id, 1.0)
         except FFmpegError as exc:
             if not self._cancelled:
@@ -277,6 +351,7 @@ class ProxyManager(QObject):
     thumb_ready = Signal(str, str)
     peaks_ready = Signal(str, str)
     proxy_ready = Signal(str, str)
+    strip_ready = Signal(str, str)
     failed = Signal(str, str)
     progress = Signal(str, float)
 
@@ -292,6 +367,7 @@ class ProxyManager(QObject):
         self._signals.thumb_ready.connect(self.thumb_ready)
         self._signals.peaks_ready.connect(self.peaks_ready)
         self._signals.proxy_ready.connect(self.proxy_ready)
+        self._signals.strip_ready.connect(self.strip_ready)
         self._signals.failed.connect(self.failed)
         self._signals.progress.connect(self.progress)
 
@@ -331,6 +407,16 @@ class ProxyManager(QObject):
     def peaks_for(self, media_id: str) -> Path | None:
         path = CachePaths.for_id(media_id).peaks
         return path if path.exists() else None
+
+    def strip_for(self, media_id: str) -> tuple[Path, dict] | None:
+        """Sprite sheet and its layout, or None if it has not been made yet."""
+        paths = CachePaths.for_id(media_id)
+        if not (paths.strip.exists() and paths.strip_meta.exists()):
+            return None
+        try:
+            return paths.strip, json.loads(paths.strip_meta.read_text())
+        except (OSError, ValueError):
+            return None
 
     # -- work ------------------------------------------------------------------
 

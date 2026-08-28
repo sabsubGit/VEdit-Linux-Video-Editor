@@ -66,6 +66,9 @@ class TransportBar(QWidget):
 
         self.snap_toggle = QCheckBox("Snap")
         self.snap_toggle.setChecked(True)
+        self.thumbs_toggle = QCheckBox("Thumbs")
+        self.thumbs_toggle.setChecked(True)
+        self.thumbs_toggle.setToolTip("Show frame thumbnails along video clips")
         self.fit_button = QPushButton("Fit")
         self.fit_button.setToolTip("Zoom timeline to fit (F)")
 
@@ -79,6 +82,7 @@ class TransportBar(QWidget):
             layout.addWidget(button)
         layout.addStretch(1)
         layout.addWidget(self.snap_toggle)
+        layout.addWidget(self.thumbs_toggle)
         layout.addWidget(self.fit_button)
 
         engine.state_changed.connect(self._on_state)
@@ -112,6 +116,7 @@ class EditPage(QWidget):
             lambda on: setattr(self.timeline_panel.canvas, "snapping", on)
         )
         self.transport.fit_button.clicked.connect(self.timeline_panel.canvas.zoom_to_fit)
+        self.transport.thumbs_toggle.toggled.connect(self._set_filmstrips)
 
         # The engine drives the playhead while playing; the canvas drives it
         # while scrubbing. Both routes end at project.set_playhead.
@@ -137,6 +142,10 @@ class EditPage(QWidget):
         layout.addWidget(splitter)
 
         self._build_actions()
+
+    def _set_filmstrips(self, enabled: bool) -> None:
+        self.timeline_panel.canvas.show_filmstrips = enabled
+        self.timeline_panel.canvas.update()
 
     # -- actions ---------------------------------------------------------------
 

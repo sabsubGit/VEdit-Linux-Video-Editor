@@ -13,9 +13,11 @@ vedit does the 90% case well: **import anything, cut it, export it.**
 Three pages, mirroring how the work splits up.
 
 - **Media** — drag and drop files or folders into the pool. Thumbnails, waveform
-  peaks and preview proxies generate in the background.
+  peaks, filmstrips and preview proxies generate in the background.
 - **Edit** — preview viewer with a scrubber, and a timeline with three video and
-  three audio lanes. Razor, trim, move, ripple delete, clip speed, undo.
+  three audio lanes. Video clips show a filmstrip of frames and audio clips show
+  their waveform, so a lane can be read at a glance. Razor, trim, move, ripple
+  delete, clip speed, undo.
 - **Render** — pick a preset and a destination, queue it, watch it go.
 
 ## Requirements
@@ -103,6 +105,13 @@ exact `Fraction` frame rate; floats only appear at the ffmpeg boundary. A clip's
 25 fps source into a 30 fps timeline needs no rate conversion anywhere — the
 source is addressed by time, which is the unit both ffmpeg's `trim` filter and
 PyAV's `seek` already want.
+
+**Filmstrips are sprite sheets, not files.** Each source gets one tiled image of
+periodic frames at ingest, generated from the proxy because pulling 300 frames
+through a 540p short-GOP file is far cheaper than decoding the original. The
+timeline repaints on every frame during playback, so drawing has to be cheap:
+blitting cells out of one already-loaded pixmap costs about 0.6 ms per repaint
+for a full timeline. Toggle them with the **Thumbs** checkbox.
 
 **Proxies make Python fast enough.** On import, each source gets a 540p H.264
 proxy with a 12-frame GOP. The short GOP is the important part: a seek lands near

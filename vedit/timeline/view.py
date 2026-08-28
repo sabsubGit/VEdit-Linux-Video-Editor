@@ -33,6 +33,7 @@ from vedit.core.project import Project
 from vedit.media.pool import MediaPool
 from vedit.timeline import ops
 from vedit.timeline.model import Clip, Timeline, TimelineError, Track
+from vedit.timeline.filmstrip import FilmstripCache, draw_filmstrip
 from vedit.timeline.waveform import WaveformCache, draw_waveform
 
 RULER_HEIGHT = 26
@@ -78,6 +79,8 @@ class TimelineCanvas(QWidget):
         super().__init__(parent)
         self.project = project
         self.waveforms = WaveformCache()
+        self.filmstrips = FilmstripCache()
+        self.show_filmstrips = True
 
         self.px_per_frame = 2.0
         self.scroll_x = 0.0
@@ -109,6 +112,7 @@ class TimelineCanvas(QWidget):
         project.playhead_changed.connect(lambda *_: self.update())
         project.selection_changed.connect(self.update)
         project.proxies.peaks_ready.connect(lambda *_: self.update())
+        project.proxies.strip_ready.connect(lambda *_: self.update())
 
     # -- convenience -----------------------------------------------------------
 
@@ -411,6 +415,8 @@ class TimelineCanvas(QWidget):
 
                 if clip.kind == "audio" and rect.width() > 4:
                     self._paint_waveform(painter, clip, rect)
+                elif clip.kind == "video" and self.show_filmstrips and rect.width() > 6:
+                    self._paint_filmstrip(painter, clip, rect)
 
                 painter.setRenderHint(QPainter.Antialiasing, True)
                 painter.setPen(QPen(border, 2 if is_selected else 1))
@@ -422,7 +428,12 @@ class TimelineCanvas(QWidget):
                     label = metrics.elidedText(
                         clip.name or "clip", Qt.ElideMiddle, int(rect.width()) - 10
                     )
-                    painter.setPen(QColor(255, 255, 255, 225))
+                    if clip.kind == "video" and self.show_filmstrips:
+                        # Thumbnails are busy; the name needs its own backing or
+                        # it becomes unreadable over a bright frame.
+                        band = QRectF(rect.left(), rect.top(), rect.width(), 17)
+                        painter.fillRect(band, QColor(0, 0, 0, 130))
+                    painter.setPen(QColor(255, 255, 255, 235))
                     painter.drawText(int(rect.left()) + 5, int(rect.top()) + 14, label)
 
     def _paint_lane_change(self, painter: QPainter) -> None:
@@ -469,6 +480,42 @@ class TimelineCanvas(QWidget):
                 label = metrics.elidedText(clip.name or "clip", Qt.ElideMiddle, int(rect.width()) - 10)
                 painter.setPen(QColor(255, 255, 255, 225))
                 painter.drawText(int(rect.left()) + 5, int(rect.top()) + 14, label)
+
+    def _paint_filmstrip(self, painter: QPainter, clip: Clip, rect: QRectF) -> None:
+        strip = self.filmstrips.get(clip.media_id, self.project.proxies.strip_for(clip.media_id))
+        if strip is None:
+            return
+
+        fps = float(self.timeline.timebase.fps)
+        if fps <= 0 or self.px_per_frame <= 0:
+            return
+
+        painter.save()
+        # Clip to the rounded body so thumbnails cannot square off the corners.
+        path = QPainterPath()
+        path.addRoundedRect(rect, CLIP_RADIUS, CLIP_RADIUS)
+        painter.setClipPath(path)
+
+        # A retimed clip plays through its source faster or slower, and the strip
+        # should show the frames it actually plays.
+        seconds_per_pixel = clip.speed / (self.px_per_frame * fps)
+        start_seconds = clip.src_in / fps
+
+        # The visible left edge may be scrolled off; start from what is on screen.
+        hidden = max(0.0, HEADER_WIDTH - rect.left())
+        visible = QRectF(rect)
+        if hidden > 0:
+            visible.setLeft(rect.left() + hidden)
+            start_seconds += hidden * seconds_per_pixel
+
+        draw_filmstrip(
+            painter,
+            visible,
+            strip,
+            start_seconds=start_seconds,
+            seconds_per_pixel=seconds_per_pixel,
+        )
+        painter.restore()
 
     def _paint_waveform(self, painter: QPainter, clip: Clip, rect: QRectF) -> None:
         peaks = self.waveforms.get(clip.media_id, self.project.proxies.peaks_for(clip.media_id))
