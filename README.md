@@ -37,7 +37,7 @@ Four pages, mirroring how the work splits up.
 
 - Python 3.11+
 - `ffmpeg` and `ffprobe` on `PATH`
-- PySide6 and PyAV (installed below)
+- PySide6, PyAV and NumPy (installed below)
 
 An NVIDIA GPU is used for proxy generation and optional NVENC export when
 present, but nothing requires it.
@@ -48,6 +48,18 @@ present, but nothing requires it.
 python3 -m venv .venv
 .venv/bin/pip install -e .
 ```
+
+That installs vedit and its dependencies together. To install only the
+dependencies — into an existing environment, say, or to run from the source
+tree without installing:
+
+```bash
+.venv/bin/pip install -r requirements.txt        # to run it
+.venv/bin/pip install -r requirements-dev.txt    # to run the tests as well
+```
+
+`ffmpeg` and `ffprobe` are not Python packages, so pip will not bring them in;
+install them with your distribution's package manager.
 
 ## Run
 

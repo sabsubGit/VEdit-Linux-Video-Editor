@@ -1,0 +1,14 @@
+# Runtime dependencies for vedit.
+#
+#     pip install -r requirements.txt
+#
+# This mirrors [project].dependencies in pyproject.toml, so `pip install -e .`
+# installs the same set — this file is for when you just want the dependencies
+# in an environment without installing vedit itself.
+#
+# ffmpeg and ffprobe are NOT Python packages and pip will not install them.
+# They have to be on PATH already; see the README.
+
+PySide6>=6.6
+av>=14
+numpy>=1.24
