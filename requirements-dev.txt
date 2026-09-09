@@ -1,9 +1,0 @@
-# Everything above, plus what the test suite needs.
-#
-#     pip install -r requirements-dev.txt
-#
-# The slow tests shell out to a real ffmpeg, so that still has to be on PATH.
-
--r requirements.txt
-
-pytest>=8

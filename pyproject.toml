@@ -15,6 +15,11 @@ dependencies = [
     "numpy>=1.24",
 ]
 
+[project.optional-dependencies]
+# `pip install -e ".[dev]"` for the test suite. The slow tests also shell out to
+# a real ffmpeg, which pip cannot install.
+dev = ["pytest>=8"]
+
 [project.scripts]
 vedit = "vedit.__main__:main"
 
