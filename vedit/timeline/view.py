@@ -1076,15 +1076,22 @@ class TimelineCanvas(QWidget):
         painter.setBrush(Qt.NoBrush)
         painter.drawPath(shape)
 
-        # A dot on each corner of the shape, which is exactly where the four
-        # handles are: the two on the floor move where the zoom starts and
-        # stops, the two on the plateau set how fast it gets there. White
+        # Two dots, both along the top. The shape has four corners and all four
+        # are grabbable, but a dot on the floor of the block sits on the clip's
+        # own bottom edge and reads as belonging to the clip rather than to the
+        # zoom — so the grips that get drawn are the ones on the plateau. White
         # because the block is amber and a grip has to be findable against it.
+        #
+        # Where the region is too narrow to have told the ramps apart, the
+        # plateau corners are the edges, and those are what a grab there gets
+        # (`zoom_handle_at` decides by height, and only above this width) — so
+        # the dots still sit over the handle they actually work.
         painter.setPen(QPen(QColor(40, 40, 40, 200), 1.0))
         painter.setBrush(QColor(255, 255, 255))
-        grips = [(start, bottom), (end, bottom)]
         if end - start >= ZOOM_NARROW_PX:
-            grips += [(ramp_in, top), (ramp_out, top)]
+            grips = [(ramp_in, top), (ramp_out, top)]
+        else:
+            grips = [(start, top), (end, top)]
         radius = 3.2 if lit else 2.6
         for x, y in grips:
             painter.drawEllipse(QPointF(x, y), radius, radius)
@@ -1576,6 +1583,11 @@ class TimelineCanvas(QWidget):
         pos = event.position().toPoint()
 
         if self._mode is Mode.IDLE:
+            # Hovering *is* the idle case, so tracking it has to happen here.
+            # It used to be left to the code below, which this return never
+            # reaches — so the block lit up only while something was already
+            # being dragged, which is the one time nobody is looking for it.
+            self._track_zoom_hover(pos)
             self._update_cursor(pos)
             return
 

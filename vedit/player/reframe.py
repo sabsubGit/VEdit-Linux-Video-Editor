@@ -49,6 +49,11 @@ class ReframeOverlay(QWidget):
     zoomed = Signal(object)        # Framing, from a box dragged with the Zoom tool
     title_moved = Signal(object, object)     # clip, Title — live during a drag
     title_committed = Signal(object, object)  # clip, Title — once, on release
+    # The picture's rectangle changed, so anything anchored to it is now stale.
+    # The corner handles recover on their own because they are computed from
+    # `picture_rect()` every time they are drawn or hit-tested; the title grab
+    # rects cannot, because they are handed in from outside.
+    picture_moved = Signal()
 
     def __init__(self, surface, parent=None) -> None:
         super().__init__(parent or surface)
@@ -90,6 +95,12 @@ class ReframeOverlay(QWidget):
         if watched is self.surface and event.type() == QEvent.Resize:
             self.setGeometry(self.surface.rect())
             self._place_bar()
+            # Resizing moves the words on screen. Without this the grab rects
+            # stay where the picture used to be, so the title is visibly in one
+            # place and grabbable in another — and at startup they are computed
+            # before the viewer has been laid out at all, which leaves nothing
+            # to grab anywhere.
+            self.picture_moved.emit()
         return False
 
     # -- state -----------------------------------------------------------------

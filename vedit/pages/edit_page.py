@@ -208,6 +208,9 @@ class EditPage(QWidget):
         self.reframe.title_committed.connect(self._title_committed)
         project.playhead_changed.connect(lambda *_: self._sync_reframe())
         project.timeline_changed.connect(self._sync_reframe)
+        # The timeline is not the only thing that moves the words: so does the
+        # viewer changing size.
+        self.reframe.picture_moved.connect(self._sync_titles)
 
         # The engine drives the playhead while playing; the canvas drives it
         # while scrubbing. Both routes end at project.set_playhead.

@@ -1103,3 +1103,157 @@ class TestTheGripsAndTheCursor:
         canvas.update()
         canvas.render(target)
         assert target != unlit, "hovering the block should change how it looks"
+
+
+class TestHoverThroughTheMouse:
+    """The highlight, driven the way a hand drives it.
+
+    The hover tests above call `_track_zoom_hover` themselves, which is why a
+    real regression hid under a passing suite: the idle branch of the move
+    handler returned before ever reaching that call, so the block lit up only
+    while some *other* drag was in progress. Nothing that pokes the tracker
+    directly can see that. These send the event instead.
+    """
+
+    @pytest.fixture
+    def canvas(self, qt_app, monkeypatch, tmp_path):
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        from vedit.core.project import Project
+        from vedit.timeline.view import TimelineCanvas
+
+        project = Project()
+        canvas = TimelineCanvas(project)
+        canvas.resize(1200, 400)
+        canvas.px_per_frame = 4.0
+        canvas.release_auto_fit()
+        clip = Clip(media_id="m", src_in=0, src_out=200, tl_start=0, src_length=400)
+        project.timeline.lane_for("video").insert(clip)
+        clip.zoom = Region(Framing(zoom=3.0), start=40, end=120, ramp_in=10, ramp_out=10)
+        canvas.show()
+        qt_app.processEvents()
+        yield canvas
+        canvas.close()
+
+    def _clip(self, canvas):
+        return canvas.timeline.lane_for("video").clips[0]
+
+    def _inside(self, canvas):
+        from PySide6.QtCore import QPoint
+
+        clip = self._clip(canvas)
+        for track, top, height in canvas.track_rows():
+            if clip in track.clips:
+                rect = canvas.clip_rect(clip, top, height)
+                band = canvas.zoom_band(clip, rect)
+                marks = canvas.zoom_marks(clip, rect)
+                return QPoint(int((marks[1] + marks[2]) / 2), int(band.center().y()))
+        raise AssertionError("no lane")
+
+    def _move_to(self, qt_app, canvas, point):
+        from PySide6.QtCore import QPointF
+        from PySide6.QtGui import QMouseEvent
+        from PySide6.QtCore import QEvent
+
+        qt_app.sendEvent(canvas, QMouseEvent(
+            QEvent.MouseMove,
+            QPointF(point),
+            QPointF(canvas.mapToGlobal(point)),
+            Qt.NoButton, Qt.NoButton, Qt.NoModifier,
+        ))
+
+    def test_moving_the_mouse_over_the_block_lights_it(self, qt_app, canvas):
+        self._move_to(qt_app, canvas, self._inside(canvas))
+        assert canvas._zoom_hover == self._clip(canvas).clip_id
+
+    def test_moving_off_it_puts_it_out(self, qt_app, canvas):
+        from PySide6.QtCore import QPoint
+
+        inside = self._inside(canvas)
+        self._move_to(qt_app, canvas, inside)
+        assert canvas._zoom_hover is not None
+
+        self._move_to(qt_app, canvas, QPoint(int(canvas.x_of(180)), inside.y()))
+        assert canvas._zoom_hover is None
+
+    def test_the_cached_picture_is_dropped_so_the_highlight_can_show(self, qt_app, canvas):
+        """A repaint that reuses the cache would leave the block unlit."""
+        canvas.grab()                    # force the cache to be built
+        assert canvas._cache is not None
+        self._move_to(qt_app, canvas, self._inside(canvas))
+        assert canvas._cache is None
+
+
+class TestTheGripsSitOnTop:
+    """Only the plateau corners get a dot.
+
+    All four corners are grabbable, but a dot on the floor of the block lands on
+    the clip's own bottom edge and reads as part of the clip rather than part of
+    the zoom.
+    """
+
+    @pytest.fixture
+    def canvas(self, qt_app, monkeypatch, tmp_path):
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        from vedit.core.project import Project
+        from vedit.timeline.view import TimelineCanvas
+
+        project = Project()
+        canvas = TimelineCanvas(project)
+        canvas.resize(1200, 400)
+        canvas.px_per_frame = 4.0
+        canvas.release_auto_fit()
+        clip = Clip(media_id="m", src_in=0, src_out=200, tl_start=0, src_length=400)
+        project.timeline.lane_for("video").insert(clip)
+        clip.zoom = Region(Framing(zoom=3.0), start=40, end=120, ramp_in=10, ramp_out=10)
+        return canvas
+
+    def _dots(self, canvas):
+        """Every ellipse the zoom block paints, as (x, y) centres."""
+        from PySide6.QtCore import QPointF, QRectF
+        from PySide6.QtGui import QPainter, QPixmap
+
+        clip = canvas.timeline.lane_for("video").clips[0]
+        row = next((top, height) for track, top, height in canvas.track_rows()
+                   if clip in track.clips)
+        rect = canvas.clip_rect(clip, row[0], row[1])
+
+        centres = []
+        real = QPainter.drawEllipse
+
+        def spy(self, *args):
+            if args and isinstance(args[0], QPointF):
+                centres.append((args[0].x(), args[0].y()))
+            return real(self, *args)
+
+        pixmap = QPixmap(1200, 400)
+        painter = QPainter(pixmap)
+        QPainter.drawEllipse = spy
+        try:
+            canvas._paint_zoom(painter, clip, rect)
+        finally:
+            QPainter.drawEllipse = real
+            painter.end()
+        return centres, canvas.zoom_band(clip, rect), canvas.zoom_marks(clip, rect)
+
+    def test_there_are_two_of_them(self, canvas):
+        centres, _, _ = self._dots(canvas)
+        assert len(centres) == 2
+
+    def test_both_sit_above_the_middle_of_the_band(self, canvas):
+        centres, band, _ = self._dots(canvas)
+        middle = band.center().y()
+        assert all(y < middle for _, y in centres), centres
+
+    def test_they_are_on_the_plateau_corners(self, canvas):
+        centres, _, marks = self._dots(canvas)
+        _, ramp_in, ramp_out, _ = marks
+        xs = sorted(x for x, _ in centres)
+        assert xs == pytest.approx([ramp_in, ramp_out], abs=0.5)
+
+    def test_a_narrow_region_still_gets_its_two(self, canvas):
+        """Too narrow to tell the ramps apart, so the dots mark the edges."""
+        clip = canvas.timeline.lane_for("video").clips[0]
+        clip.zoom = replace(clip.zoom, start=60, end=62, ramp_in=0, ramp_out=0)
+        centres, band, _ = self._dots(canvas)
+        assert len(centres) == 2
+        assert all(y < band.center().y() for _, y in centres)

@@ -542,3 +542,97 @@ def title_lane(timeline, title) -> int:
         if any(c.is_title for c in track.clips):
             return index
     raise AssertionError("no title lane")
+
+
+class TestGrabbingATitleInTheViewer:
+    """The words have to be grabbable where they are drawn.
+
+    The overlay does not compute the grab rects itself — the surface hands them
+    over, because a second copy of the layout arithmetic is a second thing to
+    get wrong. The cost of that is they go stale: they are a snapshot of where
+    the words were when the timeline last changed, and the viewer changing size
+    moves the words without changing the timeline at all.
+
+    Two ways that bit. A project opened with a title already on it computed its
+    rects before the viewer had been laid out, so there was nothing to grab
+    anywhere; and any resize afterwards left the title visibly in one place and
+    grabbable in another.
+    """
+
+    @pytest.fixture
+    def window(self, qt_app, monkeypatch, tmp_path):
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
+        from vedit.app import MainWindow
+        from vedit.core.project import Project
+        from vedit.timeline import ops as ops_mod
+
+        project = Project()
+        project.edit("t", lambda t: ops_mod.add_title(t, 0, title=Title(text="HELLO")))
+        win = MainWindow(project)
+        win.resize(1400, 900)
+        win.show()
+        qt_app.processEvents()
+        win.page_bar.group.button(1).click()      # the Edit page
+        qt_app.processEvents()
+        yield win
+        win.project.undo.mark_clean()
+        win.engine.stop()
+        win.close()
+
+    def grab_rect(self, window):
+        titles = window.edit_page.reframe._titles
+        assert titles, "the overlay was told about no titles, so nothing can be grabbed"
+        return titles[0][1]
+
+    def drawn_rect(self, window):
+        clip = window.edit_page.reframe._titles[0][0]
+        return window.edit_page.surface.title_rects([clip.title])[0]
+
+    def test_the_words_can_be_grabbed_straight_after_opening(self, window):
+        assert self.grab_rect(window).contains(self.drawn_rect(window).center())
+
+    @pytest.mark.parametrize("size", [(1000, 700), (1600, 1000)])
+    def test_a_resize_moves_the_grab_rect_with_the_words(self, qt_app, window, size):
+        window.resize(*size)
+        qt_app.processEvents()
+        assert self.grab_rect(window).contains(self.drawn_rect(window).center())
+
+    def test_dragging_after_a_resize_actually_moves_the_title(self, qt_app, window):
+        from PySide6.QtCore import QPoint, Qt
+        from PySide6.QtTest import QTest
+
+        window.resize(1000, 700)
+        qt_app.processEvents()
+
+        overlay = window.edit_page.reframe
+        clip = overlay._titles[0][0]
+        centre = self.grab_rect(window).center()
+        before = window.project.timeline.find(clip.clip_id)[1].title.offset_y
+
+        QTest.mousePress(overlay, Qt.LeftButton, Qt.NoModifier, centre)
+        QTest.mouseMove(overlay, centre + QPoint(0, -70))
+        qt_app.processEvents()
+        QTest.mouseRelease(overlay, Qt.LeftButton, Qt.NoModifier, centre + QPoint(0, -70))
+        qt_app.processEvents()
+
+        after = window.project.timeline.find(clip.clip_id)[1].title.offset_y
+        assert after < before, "dragging up should have raised the words"
+
+    def test_the_drag_is_one_undo_step(self, qt_app, window):
+        from PySide6.QtCore import QPoint, Qt
+        from PySide6.QtTest import QTest
+
+        overlay = window.edit_page.reframe
+        clip = overlay._titles[0][0]
+        centre = self.grab_rect(window).center()
+        before = window.project.timeline.find(clip.clip_id)[1].title.offset_y
+
+        QTest.mousePress(overlay, Qt.LeftButton, Qt.NoModifier, centre)
+        for step in (20, 40, 70):
+            QTest.mouseMove(overlay, centre + QPoint(0, -step))
+            qt_app.processEvents()
+        QTest.mouseRelease(overlay, Qt.LeftButton, Qt.NoModifier, centre + QPoint(0, -70))
+        qt_app.processEvents()
+
+        window.project.undo_edit()
+        assert window.project.timeline.find(clip.clip_id)[1].title.offset_y == before
