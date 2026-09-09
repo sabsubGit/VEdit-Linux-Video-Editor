@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 from PySide6.QtCore import QMimeData, QPoint, QPointF, Qt
 from PySide6.QtGui import QDragEnterEvent, QDragMoveEvent, QDropEvent
+from PySide6.QtTest import QTest
 
 from vedit.core.project import Project
 from vedit.media.pool import MEDIA_MIME
@@ -149,3 +150,99 @@ class TestDropTimeline:
 
         assert not page.drop_timeline.hint.isVisible()
         assert page.drop_timeline.duration.text() != "00:00:00:00"
+
+
+class TestDeleteKeys:
+    """Delete and Backspace on the drop timeline.
+
+    The lanes here are the same canvas the Edit page uses, holding the same
+    selection — but the shortcuts that act on a selection used to live only on
+    the Edit and Audio pages, so a clip could be selected here and then not
+    deleted. Pressing Delete did nothing at all, which reads as a frozen app
+    rather than as a key that is not bound.
+
+    The Media page is also the one place two things answer to Delete: the pool
+    removes media, the timeline removes a clip. Both are scoped to their own
+    widget, so the focus decides, and that is worth a test of its own.
+    """
+
+    def place(self, qt_app, page, media_id="m1"):
+        """One clip on V1, selected, with the canvas focused."""
+        canvas = page.drop_timeline.panel.canvas
+        add_to_pool(page.project, make_media(media_id))
+        drop(qt_app, canvas, [media_id], QPoint(200, lane_centre(canvas, "V1")))
+        qt_app.processEvents()
+        clip = page.project.timeline.video_tracks[0].clips[0]
+        page.project.set_selection([clip.clip_id])
+        canvas.setFocus()
+        qt_app.processEvents()
+        return canvas, clip
+
+    def test_delete_removes_the_selected_clip(self, qt_app, page):
+        canvas, _ = self.place(qt_app, page)
+        QTest.keyClick(canvas, Qt.Key_Delete)
+        qt_app.processEvents()
+        assert page.project.timeline.video_tracks[0].clips == []
+
+    def two_clips(self, qt_app, page):
+        """Two clips on V1. Only a follower can show the difference between the keys."""
+        canvas, first = self.place(qt_app, page, "m1")
+        add_to_pool(page.project, make_media("m2"))
+        drop(qt_app, canvas, ["m2"], QPoint(600, lane_centre(canvas, "V1")))
+        qt_app.processEvents()
+        clips = sorted(page.project.timeline.video_tracks[0].clips, key=lambda c: c.tl_start)
+        assert len(clips) == 2
+        page.project.set_selection([clips[0].clip_id])
+        canvas.setFocus()
+        return canvas, clips[0], clips[1]
+
+    def test_backspace_leaves_the_gap(self, qt_app, page):
+        canvas, first, second = self.two_clips(qt_app, page)
+        follower_was = second.tl_start
+        QTest.keyClick(canvas, Qt.Key_Backspace)
+        qt_app.processEvents()
+
+        remaining = page.project.timeline.video_tracks[0].clips
+        assert [c.clip_id for c in remaining] == [second.clip_id]
+        assert remaining[0].tl_start == follower_was, "Backspace should not close the gap"
+
+    def test_delete_closes_the_gap(self, qt_app, page):
+        canvas, first, second = self.two_clips(qt_app, page)
+        follower_was = second.tl_start
+        QTest.keyClick(canvas, Qt.Key_Delete)
+        qt_app.processEvents()
+
+        remaining = page.project.timeline.video_tracks[0].clips
+        assert [c.clip_id for c in remaining] == [second.clip_id]
+        assert remaining[0].tl_start < follower_was, "Delete should ripple the follower back"
+
+    def test_delete_is_one_undo_step(self, qt_app, page):
+        canvas, _ = self.place(qt_app, page)
+        QTest.keyClick(canvas, Qt.Key_Delete)
+        qt_app.processEvents()
+        page.project.undo_edit()
+        assert len(page.project.timeline.video_tracks[0].clips) == 1
+
+    def test_delete_with_nothing_selected_says_so(self, qt_app, page):
+        canvas, _ = self.place(qt_app, page)
+        page.project.set_selection([])
+        messages = []
+        page.drop_timeline.status_message.connect(messages.append)
+        QTest.keyClick(canvas, Qt.Key_Delete)
+        qt_app.processEvents()
+        assert len(page.project.timeline.video_tracks[0].clips) == 1
+        assert messages == ["Select a clip first"]
+
+    def test_the_pool_keeps_its_own_delete(self, qt_app, page):
+        """Focus in the table removes media, not the clip that is still selected."""
+        canvas, _ = self.place(qt_app, page)
+        table = page.pool_panel.table
+        table.selectRow(0)
+        table.setFocus()
+        qt_app.processEvents()
+
+        QTest.keyClick(table, Qt.Key_Delete)
+        qt_app.processEvents()
+
+        assert page.project.pool.rowCount() == 0
+        assert len(page.project.timeline.video_tracks[0].clips) == 1

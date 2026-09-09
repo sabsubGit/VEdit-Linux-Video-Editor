@@ -13,7 +13,10 @@ vedit does the 90% case well: **import anything, cut it, export it.**
 Four pages, mirroring how the work splits up.
 
 - **Media** — drag and drop files or folders into the pool. Thumbnails, waveform
-  peaks, filmstrips and preview proxies generate in the background.
+  peaks, filmstrips and preview proxies generate in the background. A short
+  timeline under the pool takes drops so a shot can be placed where it belongs
+  without changing page; `Delete` and `Backspace` work on it, while the pool's
+  own `Delete` removes media from the pool.
 - **Edit** — preview viewer with a scrubber, a tool strip, and a timeline with
   three video and three audio lanes. Four tools you hold — **Select**, **Cut**,
   **Reframe** and **Zoom** — then Title and Dissolve, then Snap and Thumbnails,

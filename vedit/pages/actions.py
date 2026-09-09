@@ -27,15 +27,71 @@ SHUTTLE_SPEEDS = (1.0, 2.0, 4.0, 8.0)
 ZOOM_STEP = 1.3
 
 
-class TimelineActions(QObject):
+class DeleteActions(QObject):
+    """Delete and Backspace for a widget that shows clips.
+
+    Split out of `TimelineActions` because the Media page's drop timeline is the
+    same canvas holding the same selection, but has no viewer behind it: it
+    wants these two keys and none of the transport. Deleting a clip you can see
+    and have selected is not an Edit-page privilege, and a Delete that silently
+    does nothing is worse than no timeline there at all.
+    """
+
+    status_message = Signal(str)
+
+    def __init__(self, widget: QWidget, project: Project) -> None:
+        super().__init__(widget)
+        self.widget = widget
+        self.project = project
+
+    # -- installation ----------------------------------------------------------
+
+    def _add(self, text: str, shortcut, slot) -> QAction:
+        action = QAction(text, self.widget)
+        if shortcut is not None:
+            action.setShortcut(QKeySequence(shortcut) if isinstance(shortcut, str) else shortcut)
+        action.setShortcutContext(Qt.WidgetWithChildrenShortcut)
+        action.triggered.connect(slot)
+        self.widget.addAction(action)
+        return action
+
+    def install_delete_shortcuts(self) -> None:
+        """Scoped to `self.widget`, so the Media page's pool keeps its own Delete.
+
+        Both are `WidgetWithChildrenShortcut`: the pool table removes media from
+        the pool, this removes a clip from the timeline, and which one fires is
+        decided by where the focus is rather than by who installed first.
+        """
+        self._add("Ripple Delete", QKeySequence.Delete, self.ripple_delete_selection)
+        self._add("Lift", Qt.Key_Backspace, self.lift_selection)
+
+    # -- deleting --------------------------------------------------------------
+
+    def ripple_delete_selection(self) -> None:
+        self._delete_with("Ripple delete", ops.ripple_delete)
+
+    def lift_selection(self) -> None:
+        self._delete_with("Delete", ops.lift)
+
+    def _delete_with(self, label: str, operation) -> None:
+        clips = self.project.selected_clips()
+        if not clips:
+            self.status_message.emit("Select a clip first")
+            return
+        try:
+            self.project.edit(label, lambda t: operation(t, clips))
+            self.project.set_selection([])
+        except TimelineError as exc:
+            self.status_message.emit(str(exc))
+
+
+class TimelineActions(DeleteActions):
     """Transport, zoom and edit shortcuts for one page.
 
     Owns the shuttle state, which has to be per-page: J pressed twice on the
     Audio page should step up through the speeds there without the Edit page's
     copy having an opinion about it.
     """
-
-    status_message = Signal(str)
 
     def __init__(
         self,
@@ -44,9 +100,7 @@ class TimelineActions(QObject):
         engine: PlaybackEngine,
         panel: TimelinePanel,
     ) -> None:
-        super().__init__(widget)
-        self.widget = widget
-        self.project = project
+        super().__init__(widget, project)
         self.engine = engine
         self.panel = panel
 
@@ -64,15 +118,6 @@ class TimelineActions(QObject):
 
     # -- installation ----------------------------------------------------------
 
-    def _add(self, text: str, shortcut, slot) -> QAction:
-        action = QAction(text, self.widget)
-        if shortcut is not None:
-            action.setShortcut(QKeySequence(shortcut) if isinstance(shortcut, str) else shortcut)
-        action.setShortcutContext(Qt.WidgetWithChildrenShortcut)
-        action.triggered.connect(slot)
-        self.widget.addAction(action)
-        return action
-
     def _install(self) -> None:
         engine, project = self.engine, self.project
 
@@ -82,8 +127,7 @@ class TimelineActions(QObject):
         # page. Both are page-scoped, so the Audio page simply never sees this
         # one fire — it has no video lanes to put a title on.
         self._add("Add Title", "Ctrl+T", self.add_title)
-        self._add("Ripple Delete", QKeySequence.Delete, self.ripple_delete_selection)
-        self._add("Lift", Qt.Key_Backspace, self.lift_selection)
+        self.install_delete_shortcuts()
 
         self._add("Mute Clip", "M", self.toggle_mute_selection)
         self._add("Reverse Clip", "R", self.toggle_reverse_selection)
@@ -144,23 +188,6 @@ class TimelineActions(QObject):
         created = self.project.edit("Razor", lambda t: ops.razor(t, frame))
         if not created:
             self.status_message.emit("Nothing to cut at the playhead")
-
-    def ripple_delete_selection(self) -> None:
-        self._delete_with("Ripple delete", ops.ripple_delete)
-
-    def lift_selection(self) -> None:
-        self._delete_with("Delete", ops.lift)
-
-    def _delete_with(self, label: str, operation) -> None:
-        clips = self.project.selected_clips()
-        if not clips:
-            self.status_message.emit("Select a clip first")
-            return
-        try:
-            self.project.edit(label, lambda t: operation(t, clips))
-            self.project.set_selection([])
-        except TimelineError as exc:
-            self.status_message.emit(str(exc))
 
     def toggle_mute_selection(self) -> None:
         """Silence the selected audio, or the audio linked to selected picture."""

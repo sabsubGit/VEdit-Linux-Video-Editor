@@ -21,6 +21,7 @@ from vedit.core.project import Project
 from vedit.media import thumbs
 from vedit.media.pool_view import MediaPoolPanel
 from vedit.media.probe import MediaInfo
+from vedit.pages.actions import DeleteActions
 from vedit.timeline.view import (
     AUDIO_TRACK_HEIGHT_MINI,
     VIDEO_TRACK_HEIGHT_MINI,
@@ -230,6 +231,15 @@ class DropTimeline(QWidget):
         # Frame thumbnails are worth their cost on lanes you edit against; on
         # 46-pixel lanes glanced at while importing they are mostly noise.
         self.panel.canvas.show_filmstrips = False
+
+        # Delete and Backspace only — not the whole of `TimelineActions`, which
+        # would put a transport and a razor on a page with no viewer to run
+        # them against. A clip dropped in the wrong place is the mistake this
+        # page actually produces, and the key people reach for to undo it is
+        # the one that used to do nothing here.
+        self.actions = DeleteActions(self, project)
+        self.actions.install_delete_shortcuts()
+        self.actions.status_message.connect(self.status_message)
 
         title = QLabel("Timeline")
         title.setStyleSheet("font-weight: 600;")
