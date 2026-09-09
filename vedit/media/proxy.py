@@ -26,7 +26,18 @@ from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
 from vedit.core.ffmpeg import FFmpegError, ffmpeg_path, has_encoder
 from vedit.media.probe import MediaInfo
 
-PROXY_HEIGHT = 540
+# Preview resolution. 360p rather than 540p: the viewer is a fraction of the
+# screen, the export never reads a proxy, and the point of the file is to be
+# cheap. Dropping it costs a little sharpness on a full-screen preview and buys
+# two things — a proxy that is roughly twice as quick to *generate*, which is
+# what the first minute after an import is waiting on, and a smaller frame to
+# scale on every blit.
+PROXY_HEIGHT = 360
+# Pool thumbnails. Generated to fit a box rather than to a fixed height so an
+# upright phone video does not come out three times taller than a 16:9 one; the
+# pool letterboxes whatever arrives onto its own cell. Big enough to also serve
+# the Media page's details pane without visibly softening.
+THUMB_BOX = (320, 180)
 PEAKS_RATE = 8000          # Hz the waveform pass decodes at
 PEAKS_PER_SECOND = 100     # min/max buckets stored per second
 PEAKS_MAGIC = b"VEPK\x01"
@@ -67,7 +78,10 @@ class CachePaths:
         return cls(
             proxy=root / "proxies" / f"{media_id}.mp4",
             peaks=root / "peaks" / f"{media_id}.peaks",
-            thumb=root / "thumbs" / f"{media_id}.jpg",
+            # The size is in the name: an older cache holds thumbnails from a
+            # generator with different framing, and reusing those names would
+            # keep serving them forever.
+            thumb=root / "thumbs" / f"{media_id}-{THUMB_BOX[1]}.jpg",
             strip=root / "strips" / f"{media_id}.jpg",
             strip_meta=root / "strips" / f"{media_id}.json",
         )
@@ -96,8 +110,15 @@ def _proxy_video_encoder() -> list[str]:
     """Prefer NVENC — a GPU encode keeps ingest from saturating the CPU that the
     preview player needs. Falls back to x264 when NVENC is absent."""
     if has_encoder("h264_nvenc"):
-        return ["-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ll", "-cq", "28"]
-    return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "26"]
+        return ["-c:v", "h264_nvenc", "-preset", "p1", "-tune", "ll", "-cq", "30"]
+    # `ultrafast` and a short GOP: this file is watched once, scrubbed through
+    # and thrown away, so encode time matters and compression does not. The
+    # twelve-frame GOP is what makes scrubbing quick — a seek only ever has a
+    # few frames to decode before it reaches the one asked for.
+    return [
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "28",
+        "-g", "12", "-bf", "0",
+    ]
 
 
 # -- peak files ---------------------------------------------------------------
@@ -189,25 +210,56 @@ class _IngestJob(QRunnable):
         if code != 0:
             temporary.unlink(missing_ok=True)
             raise FFmpegError(f"ffmpeg exited {code}", command=full, stderr=stderr or "")
+        if not temporary.exists():
+            # A seek past the last decodable frame exits cleanly having written
+            # nothing. Saying so here keeps that out of the generic handler,
+            # where it would arrive as a bare FileNotFoundError from `replace`.
+            raise FFmpegError("ffmpeg produced no output", command=full, stderr=stderr or "")
         temporary.replace(output)
 
     # -- stages ----------------------------------------------------------------
 
     def _make_thumb(self) -> None:
-        if self.info.video is None or self.paths.thumb.exists():
+        """One representative frame for the pool.
+
+        Announced even when it was already cached. The pool builds its icons
+        from this signal and nothing else, so staying quiet about a warm cache
+        is why a reopened project used to come back with a column of blanks.
+        """
+        if self.info.video is None:
             return
+        if self.paths.thumb.exists():
+            self.signals.thumb_ready.emit(self.info.media_id, str(self.paths.thumb))
+            return
+
         # 10% in rather than frame zero: many clips open on black or a slate.
+        # Frame zero is the fallback, because on a file whose duration is
+        # overstated, or that has one keyframe and nothing after it, the seek
+        # lands past the end and decodes nothing at all.
         seek = max(float(self.info.duration) * 0.1, 0.0)
-        self._run(
-            [
-                "-ss", f"{seek:.3f}",
-                "-i", str(self.info.path),
-                "-frames:v", "1",
-                "-vf", "scale=-2:96",
-                "-q:v", "4",
-            ],
-            output=self.paths.thumb,
-        )
+        offsets = [seek, 0.0] if seek > 0 else [0.0]
+        width, height = THUMB_BOX
+
+        failure: FFmpegError | None = None
+        for offset in offsets:
+            try:
+                self._run(
+                    [
+                        "-ss", f"{offset:.3f}",
+                        "-i", str(self.info.path),
+                        "-frames:v", "1",
+                        "-vf", f"scale={width}:{height}:force_original_aspect_ratio=decrease",
+                        "-q:v", "3",
+                    ],
+                    output=self.paths.thumb,
+                )
+                break
+            except FFmpegError as exc:
+                failure = exc
+        else:
+            if not self._cancelled and failure is not None:
+                raise failure
+
         if not self._cancelled and self.paths.thumb.exists():
             self.signals.thumb_ready.emit(self.info.media_id, str(self.paths.thumb))
 
@@ -321,7 +373,16 @@ class _IngestJob(QRunnable):
         media_id = self.info.media_id
         self.signals.status.emit(media_id, Status.WORKING.value)
         try:
-            self._make_thumb()
+            # A thumbnail is a nicety; the proxy and the peaks are what make the
+            # media playable. One awkward frame must not cost it those, so this
+            # stage reports and carries on where the others abort the job.
+            try:
+                self._make_thumb()
+            except FFmpegError as exc:
+                if not self._cancelled:
+                    self.signals.failed.emit(
+                        media_id, f"no thumbnail for {self.info.name}: {exc.detail() or exc}"
+                    )
             self.signals.progress.emit(media_id, 0.15)
             self._make_peaks()
             self.signals.progress.emit(media_id, 0.35)

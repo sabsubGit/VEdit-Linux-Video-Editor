@@ -18,7 +18,9 @@ from pathlib import Path
 
 from vedit.core.timebase import TimeBase
 from vedit.media.probe import MediaInfo, UnsupportedMedia, probe
-from vedit.timeline.model import Clip, Timeline, Track  # noqa: F401
+from vedit.timeline.framing import Framing, Region
+from vedit.timeline.titles import DEFAULT_SIZE, Title
+from vedit.timeline.model import Clip, Timeline, TimelineError, Track  # noqa: F401
 
 # Version 2 added mixing: per-clip gain and fades, per-track gain and solo, and
 # a master gain. Every one of them defaults to "as it was", so a version 1 file
@@ -26,7 +28,24 @@ from vedit.timeline.model import Clip, Timeline, Track  # noqa: F401
 # refuses anything newer than it understands, and without the bump an older
 # build would open a v2 project, silently drop every gain and fade, and write
 # them away on the next save.
-FORMAT_VERSION = 2
+# Version 3 added per-clip mute and reverse. Same reasoning as the last bump:
+# both default to "as it was", so a version 1 or 2 file loads unchanged, and the
+# bump is what stops an older build silently dropping a reversal or a mute and
+# writing the loss back out on the next save.
+# Version 4 added the picture: per-clip framing (zoom and pan), a framing the
+# clip travels to, rotation and flip. Same reasoning again — an untouched clip
+# writes an identity framing, no move, a zero rotation and no flip, so every
+# older file loads unchanged, and the bump is what stops a build without this
+# feature opening a reframed project, showing it uncropped, and saving the
+# framing away. It also added the cross dissolve, which is stored on the
+# incoming clip as a length in frames and defaults to zero, and titles — clips
+# that carry words instead of media, and so have no `media_id` to relink.
+# Version 5 added the zoom region: a punch-in covering part of a clip rather
+# than all of it, with a ramp at each end. Absent means no region, which is what
+# every version 4 clip means, so those load unchanged; the bump is what stops a
+# build without the feature opening a project, playing it un-punched, and saving
+# the region away.
+FORMAT_VERSION = 5
 SUFFIX = ".vedit"
 
 
@@ -57,10 +76,124 @@ def _clip_to_dict(clip: Clip) -> dict:
         "link_id": clip.link_id,
         "name": clip.name,
         "enabled": clip.enabled,
+        "reversed": clip.reversed,
+        "muted": clip.muted,
         "gain_db": clip.gain_db,
         "fade_in": clip.fade_in,
         "fade_out": clip.fade_out,
+        # Nested rather than three flat keys: framing is one value everywhere
+        # else in the app, and splitting it here would make this the one place
+        # it could be half-written.
+        "framing": {
+            "zoom": clip.framing.zoom,
+            "x": clip.framing.x,
+            "y": clip.framing.y,
+        },
+        # Absent rather than null when the framing does not move, so a static
+        # clip's entry looks the way it always did.
+        **(
+            {
+                "framing_end": {
+                    "zoom": clip.framing_end.zoom,
+                    "x": clip.framing_end.x,
+                    "y": clip.framing_end.y,
+                }
+            }
+            if clip.framing_end is not None
+            else {}
+        ),
+        # Absent when there is none, for the same reason `framing_end` is.
+        **(
+            {
+                "zoom": {
+                    "framing": {
+                        "zoom": clip.zoom.framing.zoom,
+                        "x": clip.zoom.framing.x,
+                        "y": clip.zoom.framing.y,
+                    },
+                    "start": clip.zoom.start,
+                    "end": clip.zoom.end,
+                    "ramp_in": clip.zoom.ramp_in,
+                    "ramp_out": clip.zoom.ramp_out,
+                }
+            }
+            if clip.zoom is not None
+            else {}
+        ),
+        "rotation": clip.rotation,
+        "flipped": clip.flipped,
+        "dissolve_in": clip.dissolve_in,
+        **(
+            {
+                "title": {
+                    "text": clip.title.text,
+                    "size": clip.title.size,
+                    "position": clip.title.position,
+                    "align": clip.title.align,
+                    "colour": clip.title.colour,
+                    "shadow": clip.title.shadow,
+                    "offset_x": clip.title.offset_x,
+                    "offset_y": clip.title.offset_y,
+                }
+            }
+            if clip.title is not None
+            else {}
+        ),
     }
+
+
+def _title_from(raw) -> Title | None:
+    """Read a stored title, or None for an ordinary clip.
+
+    `Title` rejects an unknown size or position with a `ValueError`, which the
+    loader already treats as "drop this clip and keep the project".
+    """
+    if not isinstance(raw, dict):
+        return None
+    return Title(
+        text=str(raw.get("text", "")),
+        size=str(raw.get("size", DEFAULT_SIZE)),
+        position=str(raw.get("position", "centre")),
+        align=str(raw.get("align", "centre")),
+        colour=str(raw.get("colour", "#ffffff")),
+        shadow=bool(raw.get("shadow", True)),
+        offset_x=float(raw.get("offset_x", 0.0)),
+        offset_y=float(raw.get("offset_y", 0.0)),
+    )
+
+
+def _framing_from(raw) -> Framing:
+    """Read a stored framing, defaulting to "as it was" for an older file.
+
+    `Framing` rejects an out-of-range value with a `ValueError`, which the
+    loader already treats as "drop this clip and keep the project" — so a
+    corrupt zoom costs one clip rather than the whole file.
+    """
+    if not isinstance(raw, dict):
+        return Framing()
+    return Framing(
+        zoom=float(raw.get("zoom", 1.0)),
+        x=float(raw.get("x", 0.0)),
+        y=float(raw.get("y", 0.0)),
+    )
+
+
+def _region_from(raw) -> Region | None:
+    """Read a stored zoom region, or None for a file written without one.
+
+    `Region` rejects a nonsensical span the way `Framing` rejects a bad zoom,
+    and the loader treats that the same way: one clip is dropped, the project
+    still opens.
+    """
+    if not isinstance(raw, dict):
+        return None
+    return Region(
+        framing=_framing_from(raw.get("framing")),
+        start=int(raw.get("start", 0)),
+        end=int(raw.get("end", 1)),
+        ramp_in=int(raw.get("ramp_in", 0)),
+        ramp_out=int(raw.get("ramp_out", 0)),
+    )
 
 
 def project_to_dict(timeline: Timeline, media: list[MediaInfo], playhead: int = 0) -> dict:
@@ -178,12 +311,15 @@ def load_project(path: Path) -> LoadResult:
         )
         for raw_clip in raw_track.get("clips", []):
             media_id = raw_clip.get("media_id", "")
-            if media_id not in remap:
-                continue  # its media is missing; drop the clip rather than fail
+            if media_id not in remap and not isinstance(raw_clip.get("title"), dict):
+                # Its media is missing; drop the clip rather than fail. A title
+                # is exempt: it has no media to be missing, which is the whole
+                # point of it.
+                continue
             try:
                 track.clips.append(
                     Clip(
-                        media_id=remap[media_id],
+                        media_id=remap.get(media_id, ""),
                         src_in=int(raw_clip["src_in"]),
                         src_out=int(raw_clip["src_out"]),
                         tl_start=int(raw_clip["tl_start"]),
@@ -193,12 +329,28 @@ def load_project(path: Path) -> LoadResult:
                         link_id=raw_clip.get("link_id"),
                         name=raw_clip.get("name", ""),
                         enabled=bool(raw_clip.get("enabled", True)),
+                        reversed=bool(raw_clip.get("reversed", False)),
+                        muted=bool(raw_clip.get("muted", False)),
                         gain_db=float(raw_clip.get("gain_db", 0.0)),
                         fade_in=int(raw_clip.get("fade_in", 0)),
                         fade_out=int(raw_clip.get("fade_out", 0)),
+                        framing=_framing_from(raw_clip.get("framing")),
+                        zoom=_region_from(raw_clip.get("zoom")),
+                        framing_end=(
+                            _framing_from(raw_clip["framing_end"])
+                            if isinstance(raw_clip.get("framing_end"), dict)
+                            else None
+                        ),
+                        rotation=int(raw_clip.get("rotation", 0)),
+                        flipped=bool(raw_clip.get("flipped", False)),
+                        dissolve_in=int(raw_clip.get("dissolve_in", 0)),
+                        title=_title_from(raw_clip.get("title")),
                     )
                 )
-            except (KeyError, ValueError, TypeError):
+            # TimelineError too: a value can be the right *type* and still be
+            # rejected — a speed of 100x, a rotation of 45 degrees. Those are as
+            # malformed as a gain of "loud", and cost one clip, not the project.
+            except (KeyError, ValueError, TypeError, TimelineError):
                 continue
         track.sort()
         timeline.tracks.append(track)

@@ -321,3 +321,115 @@ def test_a_soloed_lane_is_the_only_one_exported(sources, tmp_path):
 
     data = ffprobe(output)
     assert any(s["codec_type"] == "audio" for s in data["streams"])
+
+
+def make_split_clip(path, *, seconds=4):
+    """A source that is black and silent for its first half, white and loud for
+    its second. Reversing it is then something a measurement can see."""
+    half = seconds / 2
+    subprocess.run(
+        [
+            "ffmpeg", "-y", "-v", "error",
+            "-f", "lavfi", "-i", f"color=c=black:s=320x180:r=30:d={half}",
+            "-f", "lavfi", "-i", f"color=c=white:s=320x180:r=30:d={half}",
+            "-f", "lavfi", "-i", f"sine=frequency=440:duration={seconds}",
+            "-filter_complex",
+            f"[0:v][1:v]concat=n=2:v=1:a=0[v];"
+            f"[2:a]volume=0:enable='lt(t,{half})'[a]",
+            "-map", "[v]", "-map", "[a]",
+            "-c:v", "libx264", "-preset", "ultrafast", "-pix_fmt", "yuv420p",
+            "-c:a", "aac", str(path),
+        ],
+        check=True,
+        capture_output=True,
+    )
+    return path
+
+
+def black_spans(path):
+    """Where `path` is black, as (start, end) pairs, via ffmpeg's blackdetect."""
+    result = subprocess.run(
+        [
+            "ffmpeg", "-hide_banner", "-i", str(path),
+            "-vf", "blackdetect=d=0.4:pic_th=0.95", "-f", "null", "-",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    spans = []
+    for line in result.stderr.splitlines():
+        if "black_start" not in line:
+            continue
+        fields = dict(
+            part.split(":", 1) for part in line.split() if ":" in part and "black" in part
+        )
+        spans.append((float(fields["black_start"]), float(fields["black_end"])))
+    return spans
+
+
+def test_a_reversed_clip_plays_its_source_backwards(sources, tmp_path):
+    """End-to-end proof for Reverse, measured rather than asserted on the graph.
+
+    The source is black then white; reversed, the black has to come out at the
+    end. Both streams are checked, because picture and sound are reversed by
+    different filters and either one could be the half that is wrong.
+    """
+    source = probe(make_split_clip(tmp_path / "split.mp4"))
+    timeline = Timeline.default(TimeBase(30), width=320, height=180)
+    ops.place_media(timeline, source, 0)
+    ops.set_reversed(timeline, list(timeline.all_clips()), True)
+
+    output = tmp_path / "reversed.mp4"
+    render_audio(timeline, Pool([source]), output)
+
+    spans = black_spans(output)
+    assert spans, "the reversed render has no black in it at all"
+    start, end = spans[0]
+    assert start > 1.5, f"black is still at the head of the file ({start}s)"
+    assert end > 3.0
+
+    head = mean_volume(output, start=0.3, duration=1.0)
+    tail = mean_volume(output, start=3.0, duration=0.7)
+    assert head > tail + 6, (
+        f"the tone should now be at the head ({head} dB) not the tail ({tail} dB)"
+    )
+
+
+def test_the_same_clip_forwards_is_the_other_way_round(sources, tmp_path):
+    """The control: without the reversal the black is at the head, so the test
+    above is measuring the reversal and not the source."""
+    source = probe(make_split_clip(tmp_path / "split.mp4"))
+    timeline = Timeline.default(TimeBase(30), width=320, height=180)
+    ops.place_media(timeline, source, 0)
+
+    output = tmp_path / "forward.mp4"
+    render_audio(timeline, Pool([source]), output)
+
+    start, _ = black_spans(output)[0]
+    assert start < 0.5, f"black should still be at the head ({start}s)"
+
+
+def test_a_muted_clip_is_silent_in_the_rendered_file(sources, tmp_path):
+    """Two cuts of the same take on one lane, the second muted. The first has to
+    survive untouched, and the second has to come out as silence of exactly its
+    own length — a mute that shortened the lane would slide everything after it.
+    """
+    info_a, _ = sources
+    timeline = Timeline.default(TimeBase(30), width=320, height=180)
+    ops.place_media(timeline, info_a, 0)
+    ops.razor(timeline, 60)
+
+    lane = timeline.audio_tracks[0]
+    ops.set_clip_muted(timeline, [lane.clips[1]], True)
+
+    output = tmp_path / "muted.mp4"
+    render_audio(timeline, Pool([info_a]), output)
+
+    assert float(ffprobe(output)["format"]["duration"]) == pytest.approx(4.0, abs=0.2)
+    heard = mean_volume(output, start=0.3, duration=1.0)
+    silenced = mean_volume(output, start=2.3, duration=1.0)
+    assert silenced < heard - 30, (
+        f"the muted half ({silenced} dB) is not silent against the heard half ({heard} dB)"
+    )
+

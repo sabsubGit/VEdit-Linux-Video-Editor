@@ -17,7 +17,6 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMessageBox,
     QPushButton,
-    QSlider,
     QSpinBox,
     QSplitter,
     QTableView,
@@ -29,7 +28,19 @@ from vedit.core.ffmpeg import FFmpegError
 from vedit.core.project import Project
 from vedit.render.graph import RenderError, build_command
 from vedit.render.job import RenderJob
-from vedit.render.presets import Preset, available_presets
+from vedit.render.presets import (
+    QUALITY_LEVELS,
+    RESOLUTIONS,
+    DEFAULT_QUALITY,
+    Preset,
+    available_presets,
+    crf_for,
+    estimated_size,
+    format_size,
+    is_adjustable,
+    quality_level,
+    resolution_for,
+)
 from vedit.render.queue import RenderQueue
 
 
@@ -52,14 +63,29 @@ class ExportSettings(QWidget):
         self.preset_note.setObjectName("PlaceholderLabel")
         self.preset_note.setWordWrap(True)
 
-        self.quality = QSlider(Qt.Horizontal)
-        self.quality.setRange(12, 34)
-        self.quality.setValue(20)
-        self.quality_label = QLabel("20")
-        self.quality.valueChanged.connect(lambda v: self.quality_label.setText(str(v)))
-        quality_row = QHBoxLayout()
-        quality_row.addWidget(self.quality, 1)
-        quality_row.addWidget(self.quality_label)
+        # Named levels rather than a CRF slider: the number is backwards, its
+        # useful range moves with the codec, and nobody outside encoding knows
+        # what 23 looks like. The note below the box says what each one costs.
+        self.quality_box = QComboBox()
+        for level in QUALITY_LEVELS:
+            self.quality_box.addItem(level.name, level.key)
+        self.quality_box.setCurrentIndex(
+            next(i for i, lv in enumerate(QUALITY_LEVELS) if lv.key == DEFAULT_QUALITY)
+        )
+        self.quality_box.currentIndexChanged.connect(self.refresh)
+
+        self.quality_note = QLabel("")
+        self.quality_note.setObjectName("PlaceholderLabel")
+        self.quality_note.setWordWrap(True)
+
+        # The named sizes people actually deliver, with the boxes left in for
+        # anything else — typing a size the list knows simply selects it again.
+        self.resolution_box = QComboBox()
+        self.resolution_box.addItem("Match timeline", "match")
+        for resolution in RESOLUTIONS:
+            self.resolution_box.addItem(resolution.label, resolution.name)
+        self.resolution_box.addItem("Custom", "custom")
+        self.resolution_box.currentIndexChanged.connect(self._on_resolution_chosen)
 
         self.width_box = QSpinBox()
         self.height_box = QSpinBox()
@@ -71,16 +97,14 @@ class ExportSettings(QWidget):
             box.setFixedWidth(84)
             box.setAlignment(Qt.AlignRight)
 
-        self.match_button = QPushButton("Match timeline")
-        self.match_button.clicked.connect(self.match_timeline)
+        for box in (self.width_box, self.height_box):
+            box.valueChanged.connect(self._on_size_typed)
 
         size_row = QHBoxLayout()
         size_row.setSpacing(6)
         size_row.addWidget(self.width_box)
         size_row.addWidget(QLabel("×"))
         size_row.addWidget(self.height_box)
-        size_row.addSpacing(8)
-        size_row.addWidget(self.match_button)
         size_row.addStretch(1)
 
         self.name_edit = QLineEdit("timeline")
@@ -96,8 +120,10 @@ class ExportSettings(QWidget):
         form.setVerticalSpacing(9)
         form.addRow("Format:", self.preset_box)
         form.addRow("", self.preset_note)
-        form.addRow("Quality:", quality_row)
-        form.addRow("Resolution:", size_row)
+        form.addRow("Quality:", self.quality_box)
+        form.addRow("", self.quality_note)
+        form.addRow("Resolution:", self.resolution_box)
+        form.addRow("", size_row)
         form.addRow("File name:", self.name_edit)
         form.addRow("Folder:", folder_row)
 
@@ -121,43 +147,123 @@ class ExportSettings(QWidget):
         layout.addStretch(1)
         layout.addWidget(self.add_button)
 
-        project.timeline_changed.connect(self.refresh)
+        self.name_edit.textChanged.connect(self.refresh)
+        project.timeline_changed.connect(self._on_timeline_changed)
         self.match_timeline()
         self._on_preset_changed()
 
     # -- state -----------------------------------------------------------------
 
-    def current_preset(self) -> Preset:
-        preset = self.presets[max(0, self.preset_box.currentIndex())]
-        preset = preset.with_quality(self.quality.value())
+    def base_preset(self) -> Preset:
+        return self.presets[max(0, self.preset_box.currentIndex())]
+
+    def quality(self):
+        """The chosen quality level."""
+        return quality_level(self.quality_box.currentData())
+
+    def size(self) -> tuple[int, int]:
         # yuv420p subsamples chroma by two, so an odd dimension makes most
         # encoders fail. The step is 2, but a typed value can still be odd.
-        width = self.width_box.value() - (self.width_box.value() % 2)
-        height = self.height_box.value() - (self.height_box.value() % 2)
-        return preset.with_size(width, height)
+        width, height = self.width_box.value(), self.height_box.value()
+        return width - width % 2, height - height % 2
+
+    def current_preset(self) -> Preset:
+        preset = self.base_preset()
+        preset = preset.with_quality(crf_for(preset, self.quality()))
+        return preset.with_size(*self.size())
 
     def match_timeline(self) -> None:
-        self.width_box.setValue(self.project.timeline.width)
-        self.height_box.setValue(self.project.timeline.height)
+        self._set_size(self.project.timeline.width, self.project.timeline.height)
+
+    # -- resolution ------------------------------------------------------------
+
+    def _set_size(self, width: int, height: int) -> None:
+        """Drive the boxes from a choice, without that reading as a typed size."""
+        for box, value in ((self.width_box, width), (self.height_box, height)):
+            blocked = box.blockSignals(True)
+            box.setValue(value)
+            box.blockSignals(blocked)
+        self.refresh()
+
+    def _on_resolution_chosen(self, *_) -> None:
+        data = self.resolution_box.currentData()
+        if data == "match":
+            self.match_timeline()
+            return
+        if data == "custom":
+            self.refresh()
+            return
+        for resolution in RESOLUTIONS:
+            if resolution.name == data:
+                self._set_size(resolution.width, resolution.height)
+                return
+
+    def _on_size_typed(self, *_) -> None:
+        """Typing a size re-labels the menu rather than fighting it.
+
+        A size the list knows selects that entry, the timeline's own size selects
+        Match timeline, and anything else is Custom — so the menu always says
+        what the boxes hold instead of pointing at a size that is no longer set.
+        """
+        width, height = self.size()
+        timeline = self.project.timeline
+        if (width, height) == (timeline.width, timeline.height):
+            target = "match"
+        else:
+            named = resolution_for(width, height)
+            target = named.name if named is not None else "custom"
+        index = self.resolution_box.findData(target)
+        if index >= 0 and index != self.resolution_box.currentIndex():
+            blocked = self.resolution_box.blockSignals(True)
+            self.resolution_box.setCurrentIndex(index)
+            self.resolution_box.blockSignals(blocked)
+        self.refresh()
+
+    def _on_timeline_changed(self, *_) -> None:
+        """Following the timeline is the whole point of Match timeline: adding a
+        4K clip to an empty project changes the format under us."""
+        if self.resolution_box.currentData() == "match":
+            self.match_timeline()
+        self.refresh()
+
+    # -- notes -----------------------------------------------------------------
 
     def _on_preset_changed(self, *_) -> None:
-        preset = self.presets[max(0, self.preset_box.currentIndex())]
+        preset = self.base_preset()
         self.preset_note.setText(preset.description)
-        # The intermediate codecs ignore CRF entirely, so hide the illusion of
-        # control rather than letting the slider look meaningful.
-        adjustable = preset.video_codec not in ("prores_ks", "dnxhd")
-        self.quality.setEnabled(adjustable)
-        self.quality_label.setEnabled(adjustable)
-        if adjustable:
-            self.quality.setValue(preset.quality)
-        else:
-            self.quality_label.setText("—")
+        # The intermediates encode at a rate fixed by their profile, so offering
+        # a quality choice there would be an illusion of control.
+        adjustable = is_adjustable(preset)
+        self.quality_box.setEnabled(adjustable)
         self.refresh()
 
     def refresh(self, *_) -> None:
         timebase = self.project.timebase
         duration = self.project.timeline.duration
-        preset = self.presets[max(0, self.preset_box.currentIndex())]
+        preset = self.base_preset()
+        level = self.quality()
+        width, height = self.size()
+        seconds = float(timebase.frames_to_seconds(duration))
+        # An empty timeline has no size to estimate, so the rate is quoted
+        # instead — still the number that makes the choice concrete.
+        rate = seconds <= 0
+        size = estimated_size(
+            preset, level, width, height, float(timebase.fps), 60.0 if rate else seconds
+        )
+        cost = f"≈ {format_size(size)}{' per minute' if rate else ''} at {width}×{height}."
+        explanation = (
+            level.description
+            if is_adjustable(preset)
+            else f"Fixed by the {preset.name.split(' · ')[0]} profile."
+        )
+        self.quality_note.setText(f"{explanation}  {cost}")
+
+        # Say what matching the timeline currently means, rather than making
+        # people select it to find out.
+        self.resolution_box.setItemText(
+            0, f"Match timeline — {self.project.timeline.width}×{self.project.timeline.height}"
+        )
+
         self.summary.setText(
             f"Timeline: {timebase.frames_to_timecode(duration)} "
             f"({duration} frames at {float(timebase.fps):g} fps)  →  "

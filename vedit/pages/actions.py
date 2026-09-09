@@ -52,6 +52,13 @@ class TimelineActions(QObject):
 
         self._shuttle_index = 0
         self._shuttle_direction = 0
+        # A page with modal tools sets this to get first refusal on Escape. It
+        # returns True if it dealt with the key. There is exactly one Escape
+        # action because two in the same scope are *ambiguous* to Qt, which
+        # resolves that by firing neither — so a second one installed by the
+        # page did not add a behaviour, it silently removed the one that was
+        # already working.
+        self.escape_hook = None
 
         self._install()
 
@@ -71,8 +78,15 @@ class TimelineActions(QObject):
 
         self._add("Play/Pause", Qt.Key_Space, engine.toggle)
         self._add("Razor", "X", self.razor_at_playhead)
+        # Ctrl+T rather than plain T, which arms the reframe tool on the Edit
+        # page. Both are page-scoped, so the Audio page simply never sees this
+        # one fire — it has no video lanes to put a title on.
+        self._add("Add Title", "Ctrl+T", self.add_title)
         self._add("Ripple Delete", QKeySequence.Delete, self.ripple_delete_selection)
         self._add("Lift", Qt.Key_Backspace, self.lift_selection)
+
+        self._add("Mute Clip", "M", self.toggle_mute_selection)
+        self._add("Reverse Clip", "R", self.toggle_reverse_selection)
 
         self._add("Previous Frame", Qt.Key_Left, lambda: engine.step(-1))
         self._add("Next Frame", Qt.Key_Right, lambda: engine.step(1))
@@ -92,7 +106,18 @@ class TimelineActions(QObject):
         self._add("Zoom Out", "-", lambda: self.zoom(1 / ZOOM_STEP))
         self._add("Fit", "F", self.panel.canvas.zoom_to_fit)
         self._add("Select All", QKeySequence.SelectAll, self.select_all)
-        self._add("Deselect", Qt.Key_Escape, lambda: project.set_selection([]))
+        self._add("Deselect", Qt.Key_Escape, self._escape)
+
+    def _escape(self) -> None:
+        """Put the tool down first, and only then clear the selection.
+
+        In that order because a held tool is the more surprising state to be
+        left in: it has changed what clicking does, and Escape is the key people
+        already press to get out of something.
+        """
+        if self.escape_hook is not None and self.escape_hook():
+            return
+        self.project.set_selection([])
 
     # -- zoom ------------------------------------------------------------------
 
@@ -104,6 +129,15 @@ class TimelineActions(QObject):
         canvas.update()
 
     # -- edit commands ---------------------------------------------------------
+
+    def add_title(self) -> None:
+        """Open a new title at the playhead. The canvas owns the dialog because
+        it is the thing that knows the project's frame size."""
+        canvas = self.panel.canvas
+        if not canvas.timeline.video_tracks:
+            self.status_message.emit("There is no video track to put a title on")
+            return
+        canvas.add_title()
 
     def razor_at_playhead(self) -> None:
         frame = self.project.playhead
@@ -125,6 +159,42 @@ class TimelineActions(QObject):
         try:
             self.project.edit(label, lambda t: operation(t, clips))
             self.project.set_selection([])
+        except TimelineError as exc:
+            self.status_message.emit(str(exc))
+
+    def toggle_mute_selection(self) -> None:
+        """Silence the selected audio, or the audio linked to selected picture."""
+        clips = self.project.selected_clips()
+        if not clips:
+            self.status_message.emit("Select a clip first")
+            return
+
+        audio = [c for c in ops.expand_links(self.project.timeline, clips) if c.kind == "audio"]
+        if not audio:
+            self.status_message.emit("Nothing in the selection has audio")
+            return
+
+        muted = audio[0].muted
+        try:
+            self.project.edit(
+                "Unmute clip" if muted else "Mute clip",
+                lambda t: ops.set_clip_muted(t, clips, not muted),
+            )
+        except TimelineError as exc:
+            self.status_message.emit(str(exc))
+
+    def toggle_reverse_selection(self) -> None:
+        clips = self.project.selected_clips()
+        if not clips:
+            self.status_message.emit("Select a clip first")
+            return
+
+        backwards = not clips[0].reversed
+        try:
+            self.project.edit(
+                "Reverse clip" if backwards else "Play forwards",
+                lambda t: ops.set_reversed(t, clips, backwards),
+            )
         except TimelineError as exc:
             self.status_message.emit(str(exc))
 

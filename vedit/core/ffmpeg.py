@@ -81,6 +81,39 @@ def has_encoder(name: str) -> bool:
     return name in encoders()
 
 
+@functools.cache
+def filters() -> frozenset[str]:
+    """Filter names this build supports.
+
+    Titles need `drawtext`, which is only present when FFmpeg was built with
+    libfreetype — common but not universal, and a build without it fails at
+    render time with a message nobody could act on. Asking first means the app
+    can say so while the title is being written instead.
+    """
+    try:
+        result = subprocess.run(
+            [ffmpeg_path(), "-hide_banner", "-filters"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return frozenset()
+
+    names: set[str] = set()
+    for line in result.stdout.splitlines():
+        # Lines look like " T. drawtext  V->V  Draw text on top of ..." after
+        # a header; the first column is a short flag field.
+        parts = line.split()
+        if len(parts) >= 3 and len(parts[0]) <= 3 and "->" in parts[2]:
+            names.add(parts[1])
+    return frozenset(names)
+
+
+def has_filter(name: str) -> bool:
+    return name in filters()
+
+
 def run(args: list[str], *, timeout: float | None = None) -> subprocess.CompletedProcess[str]:
     """Run ffmpeg/ffprobe to completion, raising FFmpegError on a non-zero exit."""
     try:

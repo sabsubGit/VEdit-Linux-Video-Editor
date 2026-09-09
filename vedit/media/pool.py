@@ -14,6 +14,7 @@ from PySide6.QtCore import QAbstractTableModel, QMimeData, QModelIndex, Qt, Sign
 from PySide6.QtGui import QIcon, QPixmap
 
 from vedit.core.timebase import TimeBase
+from vedit.media import thumbs
 from vedit.media.probe import MediaInfo, UnsupportedMedia, probe
 from vedit.media.proxy import ProxyManager, Status
 
@@ -85,7 +86,7 @@ class MediaPool(QAbstractTableModel):
             if column == 3:
                 return self._status.get(info.media_id, Status.MISSING).value
         elif role == Qt.DecorationRole and column == 0:
-            return self._thumbs.get(info.media_id)
+            return self._icon_for(info)
         elif role == Qt.ToolTipRole:
             return f"{info.path}\n{info.describe()}"
         elif role == MEDIA_ID_ROLE:
@@ -101,6 +102,28 @@ class MediaPool(QAbstractTableModel):
         if index.isValid():
             return base | Qt.ItemIsDragEnabled
         return base
+
+    def _icon_for(self, info: MediaInfo) -> QIcon:
+        """The row's icon, made once and kept.
+
+        Every row has one, including audio and including video whose thumbnail
+        is still generating — all three states are the same size, so the icon
+        landing later never shifts the name beside it.
+
+        Built here rather than at import so a project opened against a warm
+        cache shows its frames immediately, without waiting for the ingest
+        workers to walk the whole pool first.
+        """
+        icon = self._thumbs.get(info.media_id)
+        if icon is None:
+            icon = QIcon(
+                thumbs.thumbnail(
+                    self._proxies.thumb_for(info.media_id),
+                    has_video=info.video is not None,
+                )
+            )
+            self._thumbs[info.media_id] = icon
+        return icon
 
     # -- dragging out to the timeline -------------------------------------------
 
@@ -228,6 +251,9 @@ class MediaPool(QAbstractTableModel):
 
     def _on_thumb(self, media_id: str, path: str) -> None:
         pixmap = QPixmap(path)
-        if not pixmap.isNull():
-            self._thumbs[media_id] = QIcon(pixmap)
-            self._row_changed(media_id, 0)
+        if pixmap.isNull():
+            # Leave the placeholder in place: a half-written or unreadable file
+            # is a reason to keep showing a cell, not to blank the row.
+            return
+        self._thumbs[media_id] = QIcon(thumbs.letterbox(pixmap, thumbs.POOL_CELL))
+        self._row_changed(media_id, 0)

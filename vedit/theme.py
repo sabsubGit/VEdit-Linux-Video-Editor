@@ -31,8 +31,18 @@ CLIP_AUDIO_SEL = QColor("#4aa383")
 CLIP_VIDEO_EDGE = QColor("#7fb4e6")
 CLIP_AUDIO_EDGE = QColor("#7fd4b0")
 CLIP_EDGE_SEL = QColor("#ffffff")
+# Titles: neither of the media colours, because they are not media. Warm
+# against the blue of picture and the green of sound, so a lane of them reads
+# as a different kind of thing without having to be looked at.
+CLIP_TITLE = QColor("#8a6a3d")
+CLIP_TITLE_SEL = QColor("#a8834e")
+CLIP_TITLE_EDGE = QColor("#e6c48d")
 CLIP_BORDER = QColor("#0d0f12")
 WAVEFORM = QColor("#c9f0dd")
+# The zoom region's envelope. Warm against the blue of a video clip, so a
+# punch-in is visible on a lane at a glance without being mistaken for a
+# selection, which is the accent green.
+ZOOM_REGION = QColor("#f0b95c")
 
 OK = QColor("#5ac977")
 WARN = QColor("#e0a336")
@@ -131,6 +141,22 @@ def stylesheet() -> str:
     QPushButton:pressed {{ background: {ACCENT_DIM.name()}; }}
     QPushButton:disabled {{ color: {TEXT_FAINT.name()}; background: {BG_PANEL.name()}; }}
     QPushButton:default {{ border-color: {ACCENT_DIM.name()}; }}
+
+    /* Tool buttons. Flat until you touch them, so a row of them reads as a
+       strip of tools rather than a row of raised boxes competing with the
+       transport. The armed state is carried by the icon's own colour. */
+    QToolButton {{
+        background: transparent;
+        border: 1px solid transparent;
+        border-radius: 5px;
+        padding: 3px;
+    }}
+    QToolButton:hover {{ background: {BG_HOVER.name()}; }}
+    QToolButton:pressed {{ background: {ACCENT_DIM.name()}; }}
+    QToolButton:checked {{
+        background: {BG_RAISED.name()};
+        border-color: {ACCENT_DIM.name()};
+    }}
 
     /* Drawn here rather than left to the style: with a dark palette Fusion's own
        indicator is a dark box on a dark background with no visible edge. */

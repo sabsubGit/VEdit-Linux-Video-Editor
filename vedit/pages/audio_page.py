@@ -21,6 +21,7 @@ from vedit.pages.actions import TimelineActions
 from vedit.pages.edit_page import TransportBar
 from vedit.player.engine import PlaybackEngine
 from vedit.player.surface import VideoSurface
+from vedit.tools import BY_TOOL, TOOLS, Tool
 from vedit.timeline.view import (
     AUDIO_TRACK_HEIGHT_TALL,
     VIDEO_TRACK_HEIGHT,
@@ -57,8 +58,20 @@ class AudioPage(QWidget):
             lambda on: setattr(self.timeline_panel.canvas, "snapping", on)
         )
         self.transport.fit_button.clicked.connect(self.timeline_panel.canvas.zoom_to_fit)
-        # Thumbnails are a picture control and there are no video lanes here.
-        self.transport.thumbs_toggle.hide()
+        # Picture tools, and there are no video lanes here to point them at.
+        for tool in (
+            self.transport.thumbs_toggle,
+            self.transport.title_button,
+            self.transport.dissolve_button,
+            self.transport.tool_buttons[Tool.REFRAME],
+            self.transport.tool_buttons[Tool.ZOOM],
+        ):
+            tool.hide()
+        # Select and Cut do work here, so they stay and are wired to this
+        # page's own timeline.
+        self.transport.tool_group.idClicked.connect(
+            lambda index: self._set_tool(TOOLS[index].tool)
+        )
 
         engine.position_changed.connect(self._on_engine_position)
         engine.state_changed.connect(self.mixer.on_playing)
@@ -89,6 +102,21 @@ class AudioPage(QWidget):
 
         self.actions = TimelineActions(self, project, engine, self.timeline_panel)
         self.actions.status_message.connect(self.status_message)
+
+    def _set_tool(self, tool: Tool) -> None:
+        self.timeline_panel.canvas.set_tool(tool)
+        spec = BY_TOOL[tool]
+        if spec.hint:
+            self.status_message.emit(f"{spec.label}: {spec.hint}")
+
+    def focus_default(self) -> None:
+        """Where the keyboard should land when this page comes to the front.
+
+        The transport shortcuts are installed with `WidgetWithChildrenShortcut`,
+        so they only fire while focus is inside the page — the canvas is both the
+        widget that wants the arrow keys and a guarantee that Space keeps working.
+        """
+        self.timeline_panel.canvas.setFocus()
 
     def _on_engine_position(self, frame: int) -> None:
         self.project.set_playhead(frame)

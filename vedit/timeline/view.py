@@ -12,26 +12,29 @@ one undo step instead of hundreds.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import Enum, auto
 
 from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import (
     QBrush,
     QColor,
+    QCursor,
     QFont,
     QFontMetrics,
     QPainter,
     QPainterPath,
     QPen,
+    QPixmap,
     QPolygon,
 )
 from PySide6.QtWidgets import QHBoxLayout, QMenu, QScrollBar, QVBoxLayout, QWidget
 
-from vedit import theme
+from vedit import icons, theme
+from vedit.tools import Tool
 from vedit.core.project import Project
 from vedit.media.pool import MediaPool
-from vedit.timeline import levels, ops
+from vedit.timeline import framing, levels, ops, titles as titles_mod
 from vedit.timeline.model import (
     MAX_GAIN_DB,
     MIN_GAIN_DB,
@@ -52,6 +55,10 @@ AUDIO_TRACK_HEIGHT = 56
 # you can edit against rather than a decoration, and it is what gives the fade
 # handles room to be distinct from the trim handles.
 AUDIO_TRACK_HEIGHT_TALL = 112
+# The Media page's lanes. Short enough that the pool keeps most of the page,
+# tall enough that a lane is still something you can aim a drop at.
+VIDEO_TRACK_HEIGHT_MINI = 46
+AUDIO_TRACK_HEIGHT_MINI = 34
 TRACK_GAP = 2
 CLIP_RADIUS = 7           # corner rounding on clip rectangles
 NAME_BAND_HEIGHT = 21     # solid strip at the foot of a clip holding its name
@@ -59,6 +66,18 @@ TRIM_GRAB_PX = 7          # how close to an edge counts as grabbing it
 FADE_GRAB_PX = 13         # height of the corner square that takes a fade drag
 FADE_HANDLE_PX = 15       # how far in from the edge that square reaches
 GAIN_GRAB_PX = 5          # vertical tolerance on the volume line
+ZOOM_GRAB_PX = 10         # how close to a zoom region's edge counts as grabbing it
+ZOOM_BAND_PX = 22         # height of the band the zoom envelope is drawn in
+# Below this many pixels wide a region cannot show four separate handles, so it
+# offers only its two edges — the ramps stay reachable from the clip menu. Two
+# seconds of timeline is a handful of pixels when the view is zoomed out, and a
+# handle you cannot hit is worse than one that is not offered.
+ZOOM_NARROW_PX = 44
+# Where the band stops meaning "the ramp corner" and starts meaning "the edge",
+# as a fraction of its height from the top. Below half because moving a zoom's
+# start and end is the everyday adjustment and easing it is the occasional one,
+# so the edges get the larger share of the target.
+ZOOM_CORNER_BAND = 0.42
 # Peak target for Normalise. -3 dBFS rather than 0: it leaves headroom for the
 # lane and master faders to add to without the sum clipping immediately.
 NORMALISE_TARGET_DB = -3.0
@@ -74,6 +93,15 @@ class Zone(Enum):
     FADE_IN = auto()
     FADE_OUT = auto()
     GAIN = auto()
+    # The zoom region's own edges, and the two corners that slope it. Four
+    # handles on one band: where the punch-in starts and stops, and how long it
+    # takes to arrive at each end.
+    ZOOM_IN = auto()
+    ZOOM_OUT = auto()
+    ZOOM_RAMP_IN = auto()
+    ZOOM_RAMP_OUT = auto()
+
+ZOOM_ZONES = (Zone.ZOOM_IN, Zone.ZOOM_OUT, Zone.ZOOM_RAMP_IN, Zone.ZOOM_RAMP_OUT)
 
 
 @dataclass(slots=True)
@@ -88,6 +116,7 @@ class Mode(Enum):
     SCRUB = auto()
     MOVE = auto()
     TRIM = auto()
+    ZOOM = auto()
     FADE = auto()
     GAIN = auto()
 
@@ -164,12 +193,57 @@ class TimelineCanvas(QWidget):
         # Armed so a brand-new window fits itself once it has real geometry.
         self._auto_fit = True
         self.snapping = True
+        # Which tool the mouse is holding. Only Cut changes anything here; the
+        # viewer tools are the viewer's business, and Pointer is the ordinary
+        # select-move-trim behaviour every other branch already implements.
+        self._tool = Tool.POINTER
+        self._cut_frame: int | None = None
+        # A zoom region being dragged: which clip, which of its four handles,
+        # and the value the drag has reached. Held off the model until release,
+        # like every other drag here, so one gesture is one undo step.
+        self._zoom_clip: Clip | None = None
+        self._zoom_zone: Zone | None = None
+        self._zoom_region = None
+        # The clip whose zoom block the pointer is over, so it can light up. A
+        # block that responds to being pointed at is what says it is a thing you
+        # can grab, rather than a marking painted on the clip.
+        self._zoom_hover: str | None = None
+
+        # Where the playhead was last painted, so moving it can repaint the two
+        # narrow strips it occupies rather than the whole canvas. See
+        # `refresh_playhead`.
+        self._painted_playhead: tuple[float, float] | None = None
+        # The lanes as last drawn, and the geometry it was drawn for. See
+        # `_static_layer`.
+        self._cache: QPixmap | None = None
+        self._cache_key: tuple | None = None
 
         project.timeline_changed.connect(self._on_model_changed)
-        project.playhead_changed.connect(lambda *_: self.update())
+        project.playhead_changed.connect(lambda *_: self.refresh_playhead())
         project.selection_changed.connect(self.update)
         project.proxies.peaks_ready.connect(lambda *_: self.update())
         project.proxies.strip_ready.connect(lambda *_: self.update())
+
+    def set_tool(self, tool: Tool) -> None:
+        """Hold a different tool. Only Cut behaves differently on the timeline."""
+        if tool is self._tool:
+            return
+        self._tool = tool
+        self._cut_frame = None
+        if tool is Tool.CUT:
+            # Qt has no scissors cursor, so the toolbar's own drawing becomes
+            # one — through `icons.cursor`, which is the version built to
+            # survive being reduced to a one-bit mask. Drawn once here rather
+            # than per mouse move.
+            pixmap = icons.cursor("cut")
+            self.setCursor(QCursor(pixmap, pixmap.width() // 2, pixmap.height() // 2))
+        else:
+            self.unsetCursor()
+        self.update()
+
+    @property
+    def tool(self) -> Tool:
+        return self._tool
 
     # -- convenience -----------------------------------------------------------
 
@@ -305,6 +379,98 @@ class TimelineCanvas(QWidget):
             and rect.width() >= FADE_HANDLE_PX * 3
         )
 
+    # -- the zoom region -------------------------------------------------------
+
+    def zoom_region_of(self, clip: Clip):
+        """The clip's zoom region, or the value a drag on it has reached.
+
+        Everything that draws or measures the band goes through here, so the
+        shape follows the mouse for the whole gesture and settles where it is
+        let go. Reading `clip.zoom` directly would leave the band pinned to the
+        model until the release, which makes a drag feel like it did nothing
+        until it suddenly did.
+        """
+        if self._zoom_clip is not None and self._zoom_clip.clip_id == clip.clip_id:
+            return self._zoom_region
+        return clip.zoom
+
+    def zoom_band(self, clip: Clip, rect: QRectF) -> QRectF | None:
+        """Where a clip's zoom envelope is drawn, or None if it has none.
+
+        The clip's whole picture area, not a strip along the top. A short band
+        was legible enough but far too small to aim at: on a 70-pixel lane it
+        left a 22-pixel target for four handles, and dragging the edge of a two
+        second region became a matter of luck. Filling the body gives every
+        handle the clip's full height, which is the same target a trim handle
+        gets and is the reason those have never been fiddly.
+
+        The name band along the foot is left out — the words are already there.
+        """
+        if clip.kind != "video" or self.zoom_region_of(clip) is None:
+            return None
+        band_height = min(NAME_BAND_HEIGHT, max(0.0, rect.height() - 8))
+        body = QRectF(rect)
+        body.setBottom(rect.bottom() - band_height)
+        if body.height() < 6:
+            return None
+        return body
+
+    def zoom_marks(self, clip: Clip, rect: QRectF) -> tuple[float, float, float, float] | None:
+        """The four x positions of the envelope: start, full, full, end.
+
+        The middle two are where the ramps finish — the corners of the plateau
+        — so an instant zoom has all four collapse to two and draws as a square
+        block, which is exactly what "no ramp" should look like.
+        """
+        region = self.zoom_region_of(clip)
+        if region is None:
+            return None
+        left = self.x_of(clip.tl_start + region.start)
+        right = self.x_of(clip.tl_start + region.end)
+        return (
+            left,
+            left + region.ramp_in * self.px_per_frame,
+            right - region.ramp_out * self.px_per_frame,
+            right,
+        )
+
+    def _zoom_hit(self, clip: Clip, rect: QRectF, pos: QPoint) -> Zone | None:
+        """Which zoom handle, if any, is under the pointer.
+
+        The band is checked before the clip's own body but never before its trim
+        edges: a region butting up against the head of a shot must not make the
+        shot untrimmable.
+        """
+        band = self.zoom_band(clip, rect)
+        marks = self.zoom_marks(clip, rect)
+        if band is None or marks is None or not band.contains(QPointF(pos)):
+            return None
+        if min(abs(pos.x() - rect.left()), abs(pos.x() - rect.right())) <= TRIM_GRAB_PX:
+            return None
+
+        start, ramp_in, ramp_out, end = marks
+        # With no ramp its corner sits *exactly* on its edge, so the two cannot
+        # be told apart horizontally. Height decides instead, which is what the
+        # drawing already says: the plateau corners are the top of the shape and
+        # the edges run its full depth. Grabbing high sets how fast the zoom
+        # arrives, grabbing low sets when.
+        boundary = band.top() + band.height() * ZOOM_CORNER_BAND
+        corners = end - start >= ZOOM_NARROW_PX and pos.y() <= boundary
+        if corners:
+            candidates = [(ramp_in, Zone.ZOOM_RAMP_IN), (ramp_out, Zone.ZOOM_RAMP_OUT)]
+        else:
+            candidates = [(start, Zone.ZOOM_IN), (end, Zone.ZOOM_OUT)]
+
+        near = [(abs(pos.x() - x), zone) for x, zone in candidates
+                if abs(pos.x() - x) <= ZOOM_GRAB_PX]
+        if not near:
+            return None
+        # Keyed on the distance alone. Comparing the tuples lets a tie fall
+        # through to the `Zone` members, which have no ordering — and a tie is
+        # the *normal* case here, not a corner one, so this raised out of a
+        # plain mouse-move as soon as two handles lined up.
+        return min(near, key=lambda found: found[0])[1]
+
     # -- hit testing -----------------------------------------------------------
 
     def hit_test(self, pos: QPoint) -> Hit | None:
@@ -338,6 +504,10 @@ class TimelineCanvas(QWidget):
                     return Hit(track, clip, Zone.IN)
                 if rect.right() - pos.x() <= TRIM_GRAB_PX:
                     return Hit(track, clip, Zone.OUT)
+
+            zoom_zone = self._zoom_hit(clip, rect, pos)
+            if zoom_zone is not None:
+                return Hit(track, clip, zoom_zone)
 
             # Tested after trim, so a line passing near an edge cannot block one.
             if self.volume_lines and clip.kind == "audio":
@@ -388,17 +558,65 @@ class TimelineCanvas(QWidget):
 
     # -- painting --------------------------------------------------------------
 
+    def update(self, *args) -> None:
+        """Any repaint this widget asks itself for drops the cached picture.
+
+        Blunt on purpose. The cache is only safe if *every* change to what the
+        lanes look like invalidates it, and there are twenty-odd places that
+        ask for a repaint — remembering to invalidate at each of them is the
+        bug waiting to happen. Going through one door means the only way to
+        keep a stale cache is to deliberately not use this, which
+        `refresh_playhead` does and documents.
+        """
+        self._cache = None
+        super().update(*args)
+
+    def _static_layer(self) -> QPixmap:
+        """The lanes, clips and transitions, drawn once and kept.
+
+        The playhead moves thirty or sixty times a second and nothing behind it
+        changes, but redrawing it meant laying out every clip, filmstrip and
+        waveform on the timeline each time — several milliseconds, taken from
+        the thread that also feeds the decoder and the audio device. Keeping
+        the picture means a moving playhead costs a blit.
+        """
+        ratio = self.devicePixelRatioF()
+        size = self.size()
+        if (
+            self._cache is not None
+            and self._cache_key == (size.width(), size.height(), ratio)
+        ):
+            return self._cache
+
+        pixmap = QPixmap(int(size.width() * ratio), int(size.height() * ratio))
+        pixmap.setDevicePixelRatio(ratio)
+        pixmap.fill(theme.BG_DARKEST)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        # Everything below the ruler scrolls, so clip it or a lane scrolled up
+        # would paint over the timecode strip.
+        painter.setClipRect(0, RULER_HEIGHT, size.width(), size.height() - RULER_HEIGHT)
+        self._paint_lanes(painter)
+        self._paint_clips(painter)
+        self._paint_dissolves(painter)
+        painter.end()
+
+        self._cache = pixmap
+        self._cache_key = (size.width(), size.height(), ratio)
+        return pixmap
+
     def paintEvent(self, event) -> None:
         painter = QPainter(self)
         painter.setRenderHint(QPainter.Antialiasing, False)
-        painter.fillRect(self.rect(), theme.BG_DARKEST)
+        painter.drawPixmap(0, 0, self._static_layer())
 
-        # Everything below the ruler scrolls, so clip it or a lane scrolled up
-        # would paint over the timecode strip.
+        # Live on top of the cached picture: everything that follows the mouse
+        # or the playhead. The headers stay here rather than going into the
+        # cache because they are painted *over* these — a drop indicator must
+        # not run across the track names.
         painter.save()
         painter.setClipRect(0, RULER_HEIGHT, self.width(), self.height() - RULER_HEIGHT)
-        self._paint_lanes(painter)
-        self._paint_clips(painter)
+        self._paint_cut_line(painter)
         self._paint_lane_change(painter)
         self._paint_drop_indicator(painter)
         self._paint_snap_line(painter)
@@ -501,6 +719,18 @@ class TimelineCanvas(QWidget):
                 painter.drawText(11, top + height - 8, f"{track.gain_db:+.1f} dB")
 
     def _clip_colours(self, clip: Clip, selected: bool) -> tuple[QColor, QColor]:
+        if clip.is_title:
+            # Its own colour, because a title is not a shot: it has no
+            # filmstrip, no waveform and no media, and a lane of them should be
+            # readable as something else at a glance.
+            return (
+                (theme.CLIP_TITLE_SEL, theme.CLIP_EDGE_SEL)
+                if selected
+                else (theme.CLIP_TITLE, theme.CLIP_TITLE_EDGE)
+            )
+        return self._clip_colours_media(clip, selected)
+
+    def _clip_colours_media(self, clip: Clip, selected: bool) -> tuple[QColor, QColor]:
         if clip.kind == "video":
             fill = theme.CLIP_VIDEO_SEL if selected else theme.CLIP_VIDEO
             edge = theme.CLIP_VIDEO_EDGE
@@ -526,6 +756,97 @@ class TimelineCanvas(QWidget):
         # Two interlocking links, overlapping so they read as a chain.
         painter.drawRoundedRect(QRectF(x, y + 1.5, 7.0, 5.0), 2.5, 2.5)
         painter.drawRoundedRect(QRectF(x + 4.5, y + 1.5, 7.0, 5.0), 2.5, 2.5)
+        painter.restore()
+
+    @staticmethod
+    def _draw_magnifier(painter: QPainter, x: float, y: float, colour: QColor,
+                        size: float = 9.0) -> None:
+        """A magnifier, marking the band as a zoom rather than some other span.
+
+        The band is a coloured shape on a busy lane and nothing about a
+        trapezoid says "zoom" on its own. Hand-drawn for the same reason the
+        link mark is: at this size a font glyph is a lottery.
+        """
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        pen = QPen(colour, 1.3)
+        pen.setCapStyle(Qt.RoundCap)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        lens = size * 0.62
+        painter.drawEllipse(QRectF(x, y, lens, lens))
+        # The handle, out of the lower right at the usual forty-five degrees.
+        painter.drawLine(
+            QPointF(x + lens * 0.85, y + lens * 0.85),
+            QPointF(x + size, y + size),
+        )
+        painter.restore()
+
+    @staticmethod
+    def _draw_mute_icon(painter: QPainter, x: float, y: float, colour: QColor) -> None:
+        """A crossed-out speaker, marking a clip that has been silenced.
+
+        Hand-drawn for the same reason as the link mark: at this size a font
+        glyph is a lottery across platforms.
+        """
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        pen = QPen(colour, 1.4)
+        pen.setCapStyle(Qt.RoundCap)
+        painter.setPen(pen)
+        painter.setBrush(QBrush(colour))
+        # Cone: a small box at the left with a triangle opening to the right.
+        cone = QPainterPath()
+        cone.moveTo(x + 0.5, y + 3.0)
+        cone.lineTo(x + 2.5, y + 3.0)
+        cone.lineTo(x + 5.5, y + 0.5)
+        cone.lineTo(x + 5.5, y + 8.5)
+        cone.lineTo(x + 2.5, y + 6.0)
+        cone.lineTo(x + 0.5, y + 6.0)
+        cone.closeSubpath()
+        painter.fillPath(cone, QBrush(colour))
+        # The slash, drawn across the whole mark so it reads as "off" at a glance.
+        painter.drawLine(QPointF(x + 7.0, y + 1.5), QPointF(x + 12.0, y + 7.5))
+        painter.restore()
+
+    @staticmethod
+    def _draw_reverse_icon(painter: QPainter, x: float, y: float, colour: QColor) -> None:
+        """Two chevrons pointing back, marking a clip that plays backwards."""
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, True)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QBrush(colour))
+        for offset in (0.0, 5.0):
+            arrow = QPainterPath()
+            arrow.moveTo(x + offset + 4.5, y + 0.5)
+            arrow.lineTo(x + offset + 4.5, y + 8.5)
+            arrow.lineTo(x + offset + 0.5, y + 4.5)
+            arrow.closeSubpath()
+            painter.fillPath(arrow, QBrush(colour))
+        painter.restore()
+
+    @staticmethod
+    def _draw_framing_icon(
+        painter: QPainter, x: float, y: float, colour: QColor, moving: bool = False
+    ) -> None:
+        """A frame with a smaller frame inside it: this clip has been reframed.
+
+        Drawn rather than a font glyph, like the marks beside it — at eleven
+        pixels an emoji renders differently on every machine, and this has to be
+        recognisable at a glance or it is not worth the width it costs.
+        """
+        painter.save()
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        pen = QPen(colour)
+        pen.setWidthF(1.0)
+        painter.setPen(pen)
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRect(QRectF(x + 0.5, y + 0.5, 10.0, 8.0))
+        painter.fillRect(QRectF(x + 3.5, y + 2.5, 4.0, 4.0), QBrush(colour))
+        if moving:
+            # A second, smaller frame off to one side: the picture is going
+            # somewhere. Enough to tell the two apart down a lane of clips.
+            painter.drawRect(QRectF(x + 2.5, y + 1.5, 6.0, 5.0))
         painter.restore()
 
     def _paint_clips(self, painter: QPainter) -> None:
@@ -631,8 +952,15 @@ class TimelineCanvas(QWidget):
                 self._paint_fades(painter, clip, rect, content, fade_in, fade_out)
                 if self.volume_lines:
                     self._paint_gain_line(painter, rect, gain_db, metrics)
+            elif clip.is_title:
+                # Its words rather than its frames, and unconditionally: the
+                # Thumbs setting is about filmstrips, and a title has none.
+                self._paint_title_body(painter, clip, content)
             elif self.show_filmstrips:
                 self._paint_filmstrip(painter, clip, content)
+            if clip.kind == "video":
+                # Over the frames, so it describes what it covers.
+                self._paint_zoom(painter, clip, rect)
 
         if band_height > 0:
             # Clipping to the rounded body lets the band keep the bottom corners.
@@ -665,13 +993,116 @@ class TimelineCanvas(QWidget):
             cursor += 16.0
             available -= 16.0
 
-        if available > 12:
+        # State marks come before the name, so a lane of clips can be read down
+        # its left edge without stopping to parse each name.
+        if clip.reversed and available > 30:
+            self._draw_reverse_icon(painter, cursor, baseline - 11.0, text_colour)
+            cursor += 14.0
+            available -= 14.0
+
+        if clip.kind == "audio" and clip.muted and available > 30:
+            self._draw_mute_icon(painter, cursor, baseline - 11.0, theme.WARN)
+            cursor += 17.0
+            available -= 17.0
+
+        if clip.kind == "video" and clip.has_framing and available > 30:
+            self._draw_framing_icon(
+                painter, cursor, baseline - 10.0, text_colour, clip.has_move
+            )
+            cursor += 15.0
+            available -= 15.0
+
+        # A title's words are already written across its body, so the band
+        # would only say the same thing twice — unless the clip is too small
+        # for the body, in which case the band is the only place left.
+        if available > 12 and not (clip.is_title and self._title_body_fits(rect)):
             painter.setPen(text_colour)
             painter.drawText(
                 int(cursor),
                 int(baseline),
                 metrics.elidedText(clip.name or "clip", Qt.ElideMiddle, int(available)),
             )
+
+    def _paint_zoom(self, painter: QPainter, clip: Clip, rect: QRectF) -> None:
+        """The zoom region, drawn as the envelope it actually is.
+
+        A trapezoid: up over the ramp in, flat while the zoom holds, down over
+        the ramp out. It is the same picture as the fade wedge on an audio clip
+        and it is the same arithmetic underneath, so the shape can be read
+        without being explained — a square end is an instant cut to the zoom, a
+        sloped one is a glide, and how far the slope reaches is how long it
+        takes.
+        """
+        band = self.zoom_band(clip, rect)
+        marks = self.zoom_marks(clip, rect)
+        if band is None or marks is None:
+            return
+        start, ramp_in, ramp_out, end = marks
+        if end - start < 1.0:
+            return
+
+        painter.save()
+        body = QPainterPath()
+        body.addRoundedRect(rect, CLIP_RADIUS, CLIP_RADIUS)
+        painter.setClipPath(body)
+        painter.setRenderHint(QPainter.Antialiasing, True)
+
+        # Inset from the band's full height: the handles want the whole body to
+        # aim at, but a shape filling it would bury the frames underneath.
+        depth = min(band.height() - 4, max(14.0, band.height() * 0.72))
+        bottom = band.center().y() + depth / 2
+        top = bottom - depth
+        # A dark plate under the span first. Without it the envelope is drawn
+        # straight onto the filmstrip, and a thin warm line over a bright frame
+        # is invisible — which on real footage means the region is there and
+        # cannot be seen, let alone grabbed.
+        backing = QColor(theme.BG_DARKEST)
+        backing.setAlpha(165)
+        painter.fillRect(QRectF(start, top, end - start, bottom - top), backing)
+
+        shape = QPainterPath()
+        shape.moveTo(start, bottom)
+        shape.lineTo(ramp_in, top)
+        shape.lineTo(ramp_out, top)
+        shape.lineTo(end, bottom)
+        shape.closeSubpath()
+
+        lit = self._zoom_hover == clip.clip_id
+        fill = QColor(theme.ZOOM_REGION)
+        fill.setAlpha(190 if lit else 150)
+        painter.fillPath(shape, fill)
+        painter.setPen(QPen(QColor(255, 255, 255) if lit else theme.ZOOM_REGION,
+                            2.0 if lit else 1.6))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawPath(shape)
+
+        # A dot on each corner of the shape, which is exactly where the four
+        # handles are: the two on the floor move where the zoom starts and
+        # stops, the two on the plateau set how fast it gets there. White
+        # because the block is amber and a grip has to be findable against it.
+        painter.setPen(QPen(QColor(40, 40, 40, 200), 1.0))
+        painter.setBrush(QColor(255, 255, 255))
+        grips = [(start, bottom), (end, bottom)]
+        if end - start >= ZOOM_NARROW_PX:
+            grips += [(ramp_in, top), (ramp_out, top)]
+        radius = 3.2 if lit else 2.6
+        for x, y in grips:
+            painter.drawEllipse(QPointF(x, y), radius, radius)
+
+        # The magnifier goes on the plateau, which is the one part of the shape
+        # guaranteed to be at full height. Only when it fits without crowding
+        # the grips — a mark jammed against a handle reads as decoration on it.
+        icon = min(10.0, (bottom - top) - 4.0)
+        plateau = ramp_out - ramp_in
+        if icon >= 7.0 and plateau >= icon * 2.6:
+            self._draw_magnifier(
+                painter,
+                (ramp_in + ramp_out) / 2 - icon / 2,
+                top + ((bottom - top) - icon) / 2,
+                QColor(20, 20, 20, 210),
+                icon,
+            )
+        painter.restore()
 
     def _paint_fades(
         self,
@@ -768,6 +1199,47 @@ class TimelineCanvas(QWidget):
             )
         painter.restore()
 
+    def _paint_dissolves(self, painter: QPainter) -> None:
+        """A triangle across the head of each clip that dissolves in.
+
+        Drawn over the clips rather than inside one of them, because a
+        transition belongs to the join: it is the one mark on the timeline that
+        is about two clips at once, and putting it half in each is what makes a
+        row of shots readable as a sequence rather than a list.
+        """
+        for track, top, height in self.track_rows():
+            if track.kind != "video" or top + height < RULER_HEIGHT:
+                continue
+            for clip in track.clips:
+                found = track.dissolve_before(clip)
+                if found is None:
+                    continue
+                left = self.x_of(clip.tl_start)
+                right = self.x_of(clip.tl_start + found[1])
+                if right < HEADER_WIDTH or left > self.width() or right - left < 2:
+                    continue
+
+                body = QRectF(left, top + 1.0, right - left, height - 2.0)
+                painter.save()
+                painter.setClipRect(
+                    QRectF(HEADER_WIDTH, RULER_HEIGHT, self.width(), self.height())
+                )
+                painter.setRenderHint(QPainter.Antialiasing, True)
+                wedge = QPainterPath()
+                wedge.moveTo(body.left(), body.bottom())
+                wedge.lineTo(body.right(), body.top())
+                wedge.lineTo(body.right(), body.bottom())
+                wedge.closeSubpath()
+                painter.fillPath(wedge, QBrush(QColor(255, 255, 255, 42)))
+                pen = QPen(QColor(255, 255, 255, 150))
+                pen.setWidthF(1.0)
+                painter.setPen(pen)
+                painter.drawLine(
+                    QPointF(body.left(), body.bottom()),
+                    QPointF(body.right(), body.top()),
+                )
+                painter.restore()
+
     def _paint_lane_change(self, painter: QPainter) -> None:
         """Draw clips that are being dragged onto a different lane."""
         target = self._drag_target
@@ -802,7 +1274,46 @@ class TimelineCanvas(QWidget):
                 painter, clip, rect, fill, theme.CLIP_EDGE_SEL, True, metrics
             )
 
+    @staticmethod
+    def _title_body_fits(rect: QRectF) -> bool:
+        """Whether a title clip is big enough to show its words across itself.
+
+        The one predicate, asked in two places: the body draws only when it
+        fits, and the name band steps aside only when the body took over.
+        """
+        return rect.width() >= 46 and rect.height() >= NAME_BAND_HEIGHT + 12
+
+    def _paint_title_body(self, painter: QPainter, clip: Clip, rect: QRectF) -> None:
+        """The title's own words across the clip, as its thumbnail.
+
+        A title has no frames to show a filmstrip of, and its name band already
+        holds the first line elided to nothing useful. Drawing the actual text —
+        centred, in the position it will appear on screen — means a lane of
+        titles can be read the way a lane of shots can.
+        """
+        if not self._title_body_fits(rect):
+            return
+        body = rect.adjusted(6, 3, -6, -(NAME_BAND_HEIGHT + 1))
+
+        painter.save()
+        painter.setClipRect(body)
+        font = QFont(painter.font())
+        font.setPixelSize(max(9, min(int(body.height() * 0.62), 15)))
+        painter.setFont(font)
+        painter.setPen(QColor(255, 255, 255, 225))
+
+        text = " · ".join(line for line in clip.title.lines if line.strip())
+        metrics = QFontMetrics(font)
+        painter.drawText(
+            body,
+            int(Qt.AlignCenter),
+            metrics.elidedText(text or "Title", Qt.ElideRight, int(body.width())),
+        )
+        painter.restore()
+
     def _paint_filmstrip(self, painter: QPainter, clip: Clip, rect: QRectF) -> None:
+        if clip.is_title:
+            return   # nothing to show frames of
         strip = self.filmstrips.get(clip.media_id, self.project.proxies.strip_for(clip.media_id))
         if strip is None:
             return
@@ -822,7 +1333,15 @@ class TimelineCanvas(QWidget):
         seconds_per_pixel = clip.speed / (self.px_per_frame * fps)
         start_seconds = clip.src_in / fps
 
-        # The visible left edge may be scrolled off; start from what is on screen.
+        # The visible left edge may be scrolled off; start from what is on
+        # screen.
+        #
+        # Deliberately *not* narrowed to the repaint's damaged area, tempting
+        # though it is: `draw_filmstrip` tiles from `rect.left()`, so a narrower
+        # rect re-phases every thumbnail in it and crops the last one. Under a
+        # moving playhead that redraws the strip at a different alignment on
+        # every frame, which reads as the thumbnails squashing and jittering as
+        # the marker passes over them.
         hidden = max(0.0, HEADER_WIDTH - rect.left())
         visible = QRectF(rect)
         if hidden > 0:
@@ -854,12 +1373,42 @@ class TimelineCanvas(QWidget):
             src_in=clip.src_in,
             src_out=clip.src_out,
             timebase=self.timeline.timebase,
-            colour=theme.WAVEFORM,
+            # A muted clip keeps its waveform — you still need to see what is in
+            # there to decide to unmute it — but greyed, so a muted block is
+            # obvious across a lane rather than only from its badge.
+            colour=theme.TEXT_FAINT if clip.muted else theme.WAVEFORM,
         )
         painter.restore()
 
+    def refresh_playhead(self) -> None:
+        """Repaint for a playhead that has moved, and little else.
+
+        During playback this fires at the frame rate, and a whole-canvas repaint
+        costs several milliseconds of ruler, clips, filmstrips and waveforms —
+        all to move a one-pixel line. Sixty times a second that is a large share
+        of the UI thread, and the thread it is taken from is the one feeding the
+        decoder and the audio device, so the picture falls behind the sound.
+
+        Only the strip the marker vacated and the one it arrived in need
+        redrawing. A scroll invalidates that reasoning, so the auto-scroll during
+        playback still takes the full path.
+        """
+        was = self._painted_playhead
+        now = (self.x_of(self.project.playhead), self.scroll_x)
+        if was is None or was[1] != now[1]:
+            self.update()
+            return
+        self._painted_playhead = now
+        for x in (was[0], now[0]):
+            # Wide enough for the marker's arrowhead, which overhangs the line.
+            # Deliberately not `self.update`, which would throw the cached lanes
+            # away — the whole point here is that nothing behind the marker has
+            # changed, so the repaint is a blit and two thin strips.
+            super().update(int(x) - 8, 0, 17, self.height())
+
     def _paint_playhead(self, painter: QPainter) -> None:
         x = self.x_of(self.project.playhead)
+        self._painted_playhead = (x, self.scroll_x)
         if x < HEADER_WIDTH:
             return
         painter.setPen(QPen(theme.PLAYHEAD, 1))
@@ -869,6 +1418,33 @@ class TimelineCanvas(QWidget):
         painter.drawPolygon(
             QPolygon([QPoint(int(x) - 5, 0), QPoint(int(x) + 5, 0), QPoint(int(x), 8)])
         )
+
+    def _paint_cut_line(self, painter: QPainter) -> None:
+        """Where the scissors would land, previewed as you move.
+
+        The point of a cut tool over the X key is that you can see the frame you
+        are about to split before committing to it, so this line is most of the
+        feature rather than decoration on it.
+        """
+        if self._cut_frame is None:
+            return
+        x = self.x_of(self._cut_frame)
+        if x < HEADER_WIDTH or x > self.width():
+            return
+        pen = QPen(theme.WARN)
+        pen.setWidthF(1.0)
+        painter.setPen(pen)
+        painter.drawLine(int(x), RULER_HEIGHT, int(x), self.content_height())
+
+        # The timecode of the cut, so an exact split does not need the playhead
+        # parked on it first.
+        label = self.project.timebase.frames_to_timecode(self._cut_frame)
+        metrics = QFontMetrics(painter.font())
+        width = metrics.horizontalAdvance(label) + 8
+        box = QRectF(min(x + 4, self.width() - width - 2), RULER_HEIGHT + 2, width, 15)
+        painter.fillRect(box, QBrush(QColor(0, 0, 0, 170)))
+        painter.setPen(theme.WARN)
+        painter.drawText(box, Qt.AlignCenter, label)
 
     def _paint_snap_line(self, painter: QPainter) -> None:
         if self._snap_line is None:
@@ -888,7 +1464,40 @@ class TimelineCanvas(QWidget):
 
     # -- mouse -----------------------------------------------------------------
 
+    def mouseDoubleClickEvent(self, event) -> None:
+        """Open a title for editing. Double-click is where people look for it,
+        and it is the only clip type with anything to open."""
+        hit = self.hit_test(event.position().toPoint())
+        if hit is not None and hit.clip.is_title:
+            self.edit_title(hit.clip)
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def _cut_at(self, x: float) -> None:
+        """Cut every lane at a point on the ruler, like pressing X does there.
+
+        Every lane rather than only the one under the pointer: a shot and its
+        sound are two clips on two tracks, and cutting the picture while
+        leaving the sound whole is never what anyone meant.
+        """
+        frame = max(0, self.frame_of(x))
+        if not self.project.edit("Cut", lambda t: ops.razor(t, frame)):
+            self.status_message.emit("Nothing to cut there")
+
     def mousePressEvent(self, event) -> None:
+        if (
+            self._tool is Tool.CUT
+            and event.button() == Qt.LeftButton
+            and event.position().x() >= HEADER_WIDTH
+            and event.position().y() >= RULER_HEIGHT
+        ):
+            self._cut_at(event.position().x())
+            event.accept()
+            return
+        self._press_event(event)
+
+    def _press_event(self, event) -> None:
         self.setFocus()
         pos = event.position().toPoint()
 
@@ -932,6 +1541,11 @@ class TimelineCanvas(QWidget):
             self._level_clip = hit.clip
             self._gain_db = hit.clip.gain_db
             self._gain_press_db = hit.clip.gain_db
+        elif hit.zone in ZOOM_ZONES:
+            self._mode = Mode.ZOOM
+            self._zoom_clip = hit.clip
+            self._zoom_zone = hit.zone
+            self._zoom_region = hit.clip.zoom
         elif hit.zone in (Zone.FADE_IN, Zone.FADE_OUT):
             self._mode = Mode.FADE
             self._level_clip = hit.clip
@@ -948,6 +1562,17 @@ class TimelineCanvas(QWidget):
         self.update()
 
     def mouseMoveEvent(self, event) -> None:
+        if self._tool is Tool.CUT:
+            pos = event.position().toPoint()
+            inside = pos.x() >= HEADER_WIDTH and pos.y() >= RULER_HEIGHT
+            frame = max(0, self.frame_of(pos.x())) if inside else None
+            if frame != self._cut_frame:
+                self._cut_frame = frame
+                self.update()
+            return
+        self._move_event(event)
+
+    def _move_event(self, event) -> None:
         pos = event.position().toPoint()
 
         if self._mode is Mode.IDLE:
@@ -1010,6 +1635,13 @@ class TimelineCanvas(QWidget):
             self.update()
             return
 
+        if self._mode is Mode.ZOOM and self._zoom_clip is not None:
+            self._drag_zoom(self.frame_of(pos.x()))
+            self.update()
+            return
+
+        self._track_zoom_hover(pos)
+
         if self._mode is Mode.TRIM and self._trim_clip is not None:
             low, high = ops.trim_bounds(self.timeline, self._trim_clip, self._trim_edge)
             wanted = self.frame_of(pos.x())
@@ -1019,7 +1651,82 @@ class TimelineCanvas(QWidget):
             self._snap_line = target if target == self._trim_frame else None
             self.update()
 
+    def _drag_zoom(self, frame: int) -> None:
+        """One of the four zoom handles, dragged to a timeline frame.
+
+        The edges move where the zoom starts and stops; the corners set how long
+        it takes to get there. A corner is measured *inwards* from its own edge,
+        which is what makes dragging it back out to the edge mean "instant" —
+        the gesture and the value agree, so nothing has to be explained.
+
+        Clamping rather than refusing, for the same reason a trim clamps: the
+        mouse goes where it likes and a handle should stop at its limit.
+        """
+        clip, region = self._zoom_clip, self._zoom_region
+        if clip is None or region is None:
+            return
+        local = max(0, min(frame - clip.tl_start, clip.duration))
+
+        if self._zoom_zone is Zone.ZOOM_IN:
+            start = min(local, region.end - 1)
+            self._zoom_region = self._fit_ramps(region, start, region.end)
+        elif self._zoom_zone is Zone.ZOOM_OUT:
+            end = max(local, region.start + 1)
+            self._zoom_region = self._fit_ramps(region, region.start, end)
+        elif self._zoom_zone is Zone.ZOOM_RAMP_IN:
+            room = region.length - region.ramp_out
+            self._zoom_region = replace(
+                region, ramp_in=max(0, min(local - region.start, room))
+            )
+        elif self._zoom_zone is Zone.ZOOM_RAMP_OUT:
+            room = region.length - region.ramp_in
+            self._zoom_region = replace(
+                region, ramp_out=max(0, min(region.end - local, room))
+            )
+        self.status_message.emit(self._zoom_summary(self._zoom_region))
+
+    @staticmethod
+    def _fit_ramps(region, start: int, end: int):
+        """The region moved to a new span, with both ramps pulled inside it.
+
+        Both, not only the one nearest the handle being dragged: collapsing the
+        tail onto the head leaves a region one frame long, and a ramp left at
+        its old length there is longer than the zoom it belongs to — which the
+        model refuses, mid-drag, as an exception out of a mouse event.
+        """
+        length = end - start
+        ramp_in = max(0, min(region.ramp_in, length))
+        ramp_out = max(0, min(region.ramp_out, length - ramp_in))
+        return replace(
+            region, start=start, end=end, ramp_in=ramp_in, ramp_out=ramp_out
+        )
+
+    def _zoom_summary(self, region) -> str:
+        fps = float(self.timeline.timebase.fps) or 30.0
+        ramps = []
+        for frames, label in ((region.ramp_in, "in"), (region.ramp_out, "out")):
+            ramps.append("instant" if frames == 0 else f"{frames / fps:.1f}s {label}")
+        return (
+            f"Zoom {region.framing.zoom:.2f}× for {region.length / fps:.1f}s "
+            f"({', '.join(ramps)})"
+        ).replace(".00×", "×")
+
+    def leaveEvent(self, event) -> None:
+        if self._zoom_hover is not None:
+            self._zoom_hover = None
+            self.update()
+        if self._cut_frame is not None:
+            self._cut_frame = None
+            self.update()
+        super().leaveEvent(event)
+
     def mouseReleaseEvent(self, event) -> None:
+        if self._tool is Tool.CUT:
+            event.accept()
+            return
+        self._release_event(event)
+
+    def _release_event(self, event) -> None:
         mode, self._mode = self._mode, Mode.IDLE
         self._snap_line = None
 
@@ -1043,6 +1750,11 @@ class TimelineCanvas(QWidget):
                 self.project.edit(
                     f"Trim {edge}", lambda t: ops.trim(t, clip, edge, frame)
                 )
+        elif mode is Mode.ZOOM and self._zoom_clip is not None:
+            clip, region = self._zoom_clip, self._zoom_region
+            self._zoom_clip = self._zoom_zone = self._zoom_region = None
+            if region is not None and region != clip.zoom:
+                self._run("Adjust zoom", ops.set_zoom_region, [clip], region)
         elif mode is Mode.GAIN and self._level_clip is not None:
             clip, gain = self._level_clip, self._gain_db
             if abs(gain - clip.gain_db) > 1e-6:
@@ -1077,7 +1789,30 @@ class TimelineCanvas(QWidget):
             return self._drag_track
         return track
 
+    def _hovered_zoom(self, pos: QPoint) -> str | None:
+        """The clip whose zoom block is under the pointer, if any."""
+        row = self.track_at(pos.y())
+        if row is None:
+            return None
+        track, top, height = row
+        for clip in track.clips:
+            band = self.zoom_band(clip, self.clip_rect(clip, top, height))
+            marks = self.zoom_marks(clip, self.clip_rect(clip, top, height))
+            if band is None or marks is None:
+                continue
+            if band.top() <= pos.y() <= band.bottom() and marks[0] <= pos.x() <= marks[3]:
+                return clip.clip_id
+        return None
+
+    def _track_zoom_hover(self, pos: QPoint) -> None:
+        hovered = self._hovered_zoom(pos)
+        if hovered != self._zoom_hover:
+            self._zoom_hover = hovered
+            self.update()
+
     def _update_cursor(self, pos: QPoint) -> None:
+        if self._tool is Tool.CUT:
+            return   # the scissors stay until the tool is put down
         if pos.x() < HEADER_WIDTH or pos.y() < RULER_HEIGHT:
             self.setCursor(Qt.ArrowCursor)
             return
@@ -1088,6 +1823,12 @@ class TimelineCanvas(QWidget):
             self.setCursor(Qt.OpenHandCursor)
         elif hit.zone is Zone.GAIN:
             self.setCursor(Qt.SizeVerCursor)
+        elif hit.zone is Zone.ZOOM_RAMP_IN:
+            # Along the slope it is sitting on: the ramp in climbs left to
+            # right, so the corner is dragged diagonally rather than sideways.
+            self.setCursor(Qt.SizeBDiagCursor)
+        elif hit.zone is Zone.ZOOM_RAMP_OUT:
+            self.setCursor(Qt.SizeFDiagCursor)
         else:
             self.setCursor(Qt.SizeHorCursor)
 
@@ -1138,6 +1879,17 @@ class TimelineCanvas(QWidget):
                 self._track_menu(row[0], global_pos)
             return
 
+        # The zoom block gets its own menu, because right-clicking a thing you
+        # can see and grab should be about *that* thing. It is also the only way
+        # to be rid of a zoom now that the viewer has no Reset button on it.
+        hovered = self._hovered_zoom(pos)
+        if hovered is not None:
+            for track in self.timeline.tracks:
+                for clip in track.clips:
+                    if clip.clip_id == hovered:
+                        self.build_zoom_menu(clip).exec(global_pos)
+                        return
+
         hit = self.hit_test(pos)
         if hit is not None:
             # Right-clicking outside the selection selects that clip first, so
@@ -1152,6 +1904,58 @@ class TimelineCanvas(QWidget):
 
     def _clip_menu(self, clip: Clip, global_pos: QPoint) -> None:
         self.build_clip_menu(clip).exec(global_pos)
+
+    def build_zoom_menu(self, clip: Clip) -> QMenu:
+        """The menu for one zoom block, raised by right-clicking it."""
+        region = clip.zoom
+        fps = float(self.timeline.timebase.fps) or 30.0
+        menu = QMenu(self)
+
+        heading = menu.addAction(
+            f"Zoom {region.framing.zoom:.2f}\u00d7 for {region.length / fps:.1f}s"
+            .replace(".00\u00d7", "\u00d7")
+        )
+        heading.setEnabled(False)
+        menu.addSeparator()
+
+        for label, seconds in (("Instant", 0.0), ("Ease 0.3s", 0.3),
+                               ("Ease 0.6s", 0.6), ("Ease 1s", 1.0)):
+            frames = int(round(seconds * fps))
+            action = menu.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(
+                region.ramp_in == frames and region.ramp_out == frames
+            )
+            action.triggered.connect(
+                lambda _=False, f=frames: self._set_zoom_ramps([clip], f)
+            )
+
+        menu.addSeparator()
+        for factor, label in self.ZOOM_PRESETS:
+            action = menu.addAction(f"Zoom {label.replace('Punch In  ', '')}")
+            action.setCheckable(True)
+            action.setChecked(abs(region.framing.zoom - factor) < 1e-6)
+            action.triggered.connect(
+                lambda _=False, f=factor: self._set_zoom_level(clip, f)
+            )
+
+        menu.addSeparator()
+        menu.addAction(
+            "Delete Zoom",
+            lambda: self._run("Remove zoom", ops.set_zoom_region, [clip], None),
+        )
+        return menu
+
+    def _set_zoom_level(self, clip: Clip, factor: float) -> None:
+        """Change how far a region punches in, keeping where it is and its ramps."""
+        if clip.zoom is None:
+            return
+        self._run(
+            "Zoom level",
+            ops.set_zoom_region,
+            [clip],
+            replace(clip.zoom, framing=framing.with_zoom(clip.zoom.framing, factor)),
+        )
 
     def build_clip_menu(self, clip: Clip) -> QMenu:
         menu = QMenu(self)
@@ -1172,6 +1976,11 @@ class TimelineCanvas(QWidget):
         if clip.speed != 1.0:
             menu.addAction(f"Reset Speed (now {clip.speed:g}×)", lambda: self._apply_speed(1.0))
 
+        backwards = menu.addAction("Reverse\tR")
+        backwards.setCheckable(True)
+        backwards.setChecked(clip.reversed)
+        backwards.triggered.connect(lambda: self._toggle_reversed(selected))
+
         menu.addSeparator()
         group = self.timeline.linked_group(clip)
         if clip.link_id is not None and len(group) > 1:
@@ -1182,8 +1991,24 @@ class TimelineCanvas(QWidget):
         toggle = "Disable" if clip.enabled else "Enable"
         menu.addAction(toggle, lambda: self._toggle_enabled(selected))
 
-        if clip.kind == "audio":
+        # Mute is offered on picture too, because a linked pair is one thing to
+        # the person right-clicking it: `set_clip_muted` finds the audio half.
+        muted_now = self._muted_state(selected)
+        if muted_now is not None:
             menu.addSeparator()
+            mute = menu.addAction(("Unmute Clip" if muted_now else "Mute Clip") + "\tM")
+            mute.setCheckable(True)
+            mute.setChecked(muted_now)
+            mute.triggered.connect(lambda: self._toggle_mute(selected))
+
+        if clip.is_title:
+            menu.addSeparator()
+            menu.addAction("Edit Title…", lambda: self.edit_title(clip))
+        elif clip.kind == "video":
+            self._add_transition_menu(menu, clip)
+            self._add_picture_menu(menu, clip, selected)
+
+        if clip.kind == "audio":
             menu.addAction(
                 f"Normalise to {NORMALISE_TARGET_DB:g} dB", lambda: self._normalise(selected)
             )
@@ -1203,11 +2028,208 @@ class TimelineCanvas(QWidget):
         menu.addAction("Ripple Delete\tDelete", lambda: self._delete(selected, ripple=True))
         return menu
 
+    # Enough to punch in on a face or crop a wobbly edge without hunting for a
+    # number. Anything finer is what dragging the picture is for.
+    ZOOM_PRESETS = ((1.2, "Punch In  1.2×"), (1.5, "1.5×"), (2.0, "2×"))
+    # In seconds. Half a second is the everyday dissolve; the outer two are for
+    # a quick soften and a long lazy mix.
+    DISSOLVE_PRESETS = (0.25, 0.5, 1.0, 2.0)
+
+    def _add_transition_menu(self, menu: QMenu, clip: Clip) -> None:
+        """Cross dissolve into this clip from the one before it."""
+        track = self.timeline.track_of(clip)
+        current = track.dissolve_before(clip)
+
+        menu.addSeparator()
+        transitions = menu.addMenu("Dissolve In")
+        timebase = self.project.timebase
+        for seconds in self.DISSOLVE_PRESETS:
+            frames = max(1, int(round(seconds * float(timebase.fps))))
+            action = transitions.addAction(f"{seconds:g}s")
+            action.setCheckable(True)
+            action.setChecked(current is not None and current[1] == frames)
+            action.triggered.connect(
+                lambda _=False, f=frames: self._run(
+                    "Dissolve", ops.set_dissolve, clip, f
+                )
+            )
+        if current is not None:
+            transitions.addSeparator()
+            transitions.addAction(
+                f"Remove ({timebase.frames_to_timecode(current[1])})",
+                lambda: self._run("Remove dissolve", ops.set_dissolve, clip, 0),
+            )
+
+    def _add_picture_menu(self, menu: QMenu, clip: Clip, selected: list[Clip]) -> None:
+        """The picture section: framing, rotation and flip.
+
+        The first video-only section this menu has had. Kept as a submenu
+        because the top level is already long, and because everything in it is
+        the same thought — "what does this shot look like".
+        """
+        menu.addSeparator()
+        picture = menu.addMenu("Picture")
+
+        fill = picture.addAction("Fill Frame")
+        fill.setToolTip("Zoom until the black bars are gone")
+        fill.triggered.connect(lambda: self._fill_frame(clip))
+
+        for factor, label in self.ZOOM_PRESETS:
+            action = picture.addAction(label)
+            action.setCheckable(True)
+            action.setChecked(abs(clip.framing.zoom - factor) < 1e-6)
+            action.triggered.connect(lambda _=False, f=factor: self._apply_zoom(selected, f))
+
+        picture.addSeparator()
+        if clip.has_move:
+            picture.addAction(
+                "Remove Move",
+                lambda: self._run("Remove move", ops.set_framing_move, selected, None),
+            )
+        else:
+            picture.addAction(
+                "Add Move (push in)",
+                lambda: self._run(
+                    "Move framing",
+                    ops.set_framing_move,
+                    selected,
+                    framing.with_zoom(clip.framing, min(clip.framing.zoom * 1.35, 8.0)),
+                ),
+            )
+
+        if clip.has_zoom:
+            fps = float(self.timeline.timebase.fps) or 30.0
+            region = clip.zoom
+            picture.addSeparator()
+            picture.addAction(
+                f"Remove Zoom ({region.length / fps:.1f}s at "
+                f"{region.framing.zoom:.2f}\u00d7)".replace(".00\u00d7", "\u00d7"),
+                lambda: self._run("Remove zoom", ops.set_zoom_region, selected, None),
+            )
+            for label, ramp in (("Instant", 0), ("Ease 0.3s", 0.3), ("Ease 1s", 1.0)):
+                frames = int(round(ramp * fps))
+                action = picture.addAction(f"Zoom Ramp: {label}")
+                action.setCheckable(True)
+                action.setChecked(region.ramp_in == frames and region.ramp_out == frames)
+                action.triggered.connect(
+                    lambda _=False, f=frames: self._set_zoom_ramps(selected, f)
+                )
+
+        picture.addSeparator()
+        picture.addAction(
+            "Rotate Right", lambda: self._run("Rotate", ops.rotate_clips, selected, 1)
+        )
+        picture.addAction(
+            "Rotate Left", lambda: self._run("Rotate", ops.rotate_clips, selected, -1)
+        )
+        flip = picture.addAction("Flip Horizontally")
+        flip.setCheckable(True)
+        flip.setChecked(clip.flipped)
+        flip.triggered.connect(lambda: self._run("Flip", ops.toggle_flipped, selected))
+
+        if clip.has_framing:
+            picture.addSeparator()
+            picture.addAction(
+                f"Reset Picture (now {framing.describe(clip.framing, clip.rotation, clip.flipped)})",
+                lambda: self._run("Reset picture", ops.reset_framing, selected),
+            )
+
+    def _set_zoom_ramps(self, clips: list[Clip], frames: int) -> None:
+        """Both ramps at once — asking for them separately is what the corner
+        handles are for, and the menu is the place for the common answer."""
+        def both(timeline):
+            ops.set_zoom_ramp(timeline, clips, "in", frames)
+            ops.set_zoom_ramp(timeline, clips, "out", frames)
+
+        self.project.edit("Zoom ramp", both)
+
+    def _apply_zoom(self, clips: list[Clip], factor: float) -> None:
+        """Set the zoom on a selection, each clip keeping its own pan.
+
+        Keeping the pan matters: having framed a shot off-centre, changing how
+        far in you are should not throw away where you were looking.
+        """
+        for clip in clips:
+            if clip.kind != "video":
+                continue
+            self._run(
+                "Zoom", ops.set_framing, [clip], framing.with_zoom(clip.framing, factor)
+            )
+
+    def _fill_frame(self, clip: Clip) -> None:
+        """Zoom until the letterbox bars are gone.
+
+        The one-click fix for a video shot on a phone and dropped on a
+        horizontal timeline. Needs the source's real size, so it is the one
+        picture action that has to consult the media pool.
+        """
+        info = self.project.media_for(clip.media_id)
+        if info is None or info.video is None:
+            self.status_message.emit("That clip's media is not available")
+            return
+        zoom = framing.fill_zoom(
+            info.video.display_size,
+            (self.timeline.width, self.timeline.height),
+            clip.rotation,
+        )
+        if abs(zoom - 1.0) < 1e-6:
+            self.status_message.emit("That clip already fills the frame")
+            return
+        self._run(
+            "Fill frame", ops.set_framing, [clip], framing.with_zoom(clip.framing, zoom)
+        )
+
+    def add_title(self, track: Track | None = None) -> None:
+        """Put a new title at the playhead and open it for writing."""
+        from vedit.core.ffmpeg import has_filter
+
+        if not has_filter("drawtext"):
+            self.status_message.emit(
+                "This build of ffmpeg has no drawtext filter, so titles could "
+                "not be exported — install an ffmpeg built with libfreetype"
+            )
+            return
+
+        dialog = self._title_dialog(titles_mod.Title(), self.project.playhead)
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
+        title = dialog.result_title()
+        if title.is_empty:
+            self.status_message.emit("A title needs some words")
+            return
+        self._run("Add title", ops.add_title, self.project.playhead, title=title,
+                  track=track)
+
+    def edit_title(self, clip: Clip) -> None:
+        dialog = self._title_dialog(clip.title, clip.tl_start)
+        if dialog.exec() != dialog.DialogCode.Accepted:
+            return
+        self._run("Edit title", ops.set_title, clip, dialog.result_title())
+
+    def _title_dialog(self, title, at_frame: int):
+        """The dialog, showing the title over whatever is on screen behind it."""
+        from vedit.timeline.title_dialog import TitleDialog
+
+        backdrop = None
+        surface = getattr(self.window(), "_title_backdrop", None)
+        if callable(surface):
+            backdrop = surface()
+        return TitleDialog(
+            title,
+            frame=(self.timeline.width, self.timeline.height),
+            backdrop=backdrop,
+            parent=self,
+        )
+
     def _track_menu(self, track: Track, global_pos: QPoint, *, empty_area: bool = False) -> None:
         self.build_track_menu(track).exec(global_pos)
 
     def build_track_menu(self, track: Track) -> QMenu:
         menu = QMenu(self)
+
+        if track.kind == "video":
+            menu.addAction("Add Title Here…\tCtrl+T", lambda: self.add_title(track))
+            menu.addSeparator()
 
         mute = menu.addAction("Mute" if not track.muted else "Unmute")
         mute.triggered.connect(lambda: self._set_track_flag(track, "muted", not track.muted))
@@ -1248,9 +2270,15 @@ class TimelineCanvas(QWidget):
 
     # -- menu actions ----------------------------------------------------------
 
-    def _run(self, label: str, func, *args) -> None:
+    def _run(self, label: str, func, *args, **kwargs) -> None:
+        """Run an edit, showing its refusal in the status bar rather than raising.
+
+        Keywords are passed through: several ops take them, and leaving them out
+        meant `add_title` raised a `TypeError` from inside the one funnel that
+        exists to stop errors reaching the user.
+        """
         try:
-            self.project.edit(label, lambda t: func(t, *args))
+            self.project.edit(label, lambda t: func(t, *args, **kwargs))
         except TimelineError as exc:
             self.status_message.emit(str(exc))
 
@@ -1264,6 +2292,34 @@ class TimelineCanvas(QWidget):
         if not clips:
             return
         self._run(f"Speed {factor:g}x", ops.set_speed, clips, factor)
+
+    def _muted_state(self, clips: list[Clip]) -> bool | None:
+        """Whether the selection's audio is muted, or None if it has no audio.
+
+        Reported from the link group rather than the clicked clip, so the entry
+        appears on the picture half of a linked pair and reads the state its
+        sound is actually in.
+        """
+        audio = [
+            member
+            for member in ops.expand_links(self.timeline, clips)
+            if member.kind == "audio"
+        ]
+        return audio[0].muted if audio else None
+
+    def _toggle_mute(self, clips: list[Clip]) -> None:
+        muted_now = self._muted_state(clips)
+        if muted_now is None:
+            self.status_message.emit("That clip has no audio to mute")
+            return
+        self._run("Unmute clip" if muted_now else "Mute clip", ops.toggle_clip_mute, clips)
+
+    def _toggle_reversed(self, clips: list[Clip]) -> None:
+        if not clips:
+            return
+        backwards = not clips[0].reversed
+        label = "Reverse clip" if backwards else "Play forwards"
+        self._run(label, ops.set_reversed, clips, backwards)
 
     def _custom_speed(self, clip: Clip) -> None:
         from PySide6.QtWidgets import QInputDialog

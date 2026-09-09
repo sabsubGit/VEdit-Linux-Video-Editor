@@ -225,3 +225,102 @@ class TestSoloInPreview:
         timeline.audio_tracks[0].solo = True
         lists = audio_playlists(timeline, FakePool(), FakeProxies())
         assert [p.segments[0].media_id for p in lists] == ["b"]
+
+
+class TestMutedClipsInPreview:
+    """A muted clip becomes a gap of exactly its own length, so the lane's
+    timing is identical whether or not anything is muted."""
+
+    def build(self, timeline, lane=0):
+        return build_playlist(
+            timeline, timeline.audio_tracks[lane], FakePool(), FakeProxies()
+        )
+
+    def test_a_muted_clip_reads_nothing_from_disk(self, timeline):
+        clip = put(timeline, 0, "a", 0, 100, kind="audio")
+        clip.muted = True
+        segment = self.build(timeline).at(0)
+        assert segment.is_gap, "nothing is decoded for a clip nobody can hear"
+
+    def test_it_still_occupies_its_own_span(self, timeline):
+        put(timeline, 0, "a", 0, 100, kind="audio")
+        muted = put(timeline, 0, "a", 100, 100, kind="audio", src_in=100)
+        muted.muted = True
+        playlist = self.build(timeline)
+
+        assert [(s.tl_start, s.tl_end) for s in playlist.segments] == [(0, 100), (100, 200)]
+        assert playlist.at(0).is_gap is False
+        assert playlist.at(100).is_gap is True
+
+    def test_muting_the_audio_leaves_the_picture_playing(self, timeline):
+        video = put(timeline, 0, "a", 0, 100)
+        audio = put(timeline, 0, "a", 0, 100, kind="audio")
+        video.link_id = audio.link_id = "l1"
+        audio.muted = True
+
+        assert build_video_playlist(timeline, FakePool(), FakeProxies()).at(0).is_gap is False
+        assert self.build(timeline).at(0).is_gap is True
+
+    def test_a_muted_video_clip_is_not_affected(self, timeline):
+        """`muted` is an audio property; nothing sets it on picture, and the
+        video flatten does not consult it."""
+        clip = put(timeline, 0, "a", 0, 100)
+        clip.muted = True
+        assert build_video_playlist(timeline, FakePool(), FakeProxies()).at(0).is_gap is False
+
+
+class TestReversedSegments:
+    def test_the_segment_starts_at_the_out_point(self, timeline):
+        clip = put(timeline, 0, "a", 0, 100, kind="audio", src_in=20)
+        clip.reversed = True
+        segment = build_playlist(
+            timeline, timeline.audio_tracks[0], FakePool(), FakeProxies()
+        ).at(0)
+
+        assert segment.reversed is True
+        assert segment.src_start == 120
+
+    def test_source_time_walks_backwards_through_the_clip(self, timeline):
+        clip = put(timeline, 0, "a", 0, 100, kind="audio", src_in=20)
+        clip.reversed = True
+        segment = build_playlist(
+            timeline, timeline.audio_tracks[0], FakePool(), FakeProxies()
+        ).at(0)
+
+        timebase = timeline.timebase
+        assert segment.source_seconds(0, timebase) == pytest.approx(120 / 30)
+        assert segment.source_seconds(50, timebase) == pytest.approx(70 / 30)
+        assert segment.source_seconds(100, timebase) == pytest.approx(20 / 30)
+
+    def test_a_decoded_frame_maps_back_to_its_timeline_position(self, timeline):
+        clip = put(timeline, 0, "a", 0, 100, kind="audio", src_in=20)
+        clip.reversed = True
+        segment = build_playlist(
+            timeline, timeline.audio_tracks[0], FakePool(), FakeProxies()
+        ).at(0)
+
+        timebase = timeline.timebase
+        for frame in (0, 25, 60, 99):
+            seconds = segment.source_seconds(frame, timebase)
+            assert segment.timeline_frame_for(seconds, timebase) == frame
+
+    def test_neighbouring_pieces_of_one_reversed_clip_still_merge(self, timeline):
+        """A clip on a lower lane splits the flatten at its edges without ever
+        winning them. The pieces of the reversed clip above are one continuous
+        backwards read and must rejoin, or the decoder re-seeks for nothing.
+        """
+        clip = put(timeline, 1, "a", 0, 200)
+        clip.reversed = True
+        put(timeline, 0, "b", 100, 50)
+
+        playlist = build_video_playlist(timeline, FakePool(), FakeProxies())
+        assert visible(playlist) == [(0, 200, "a")]
+
+    def test_a_forward_and_a_reversed_clip_never_merge(self, timeline):
+        first = put(timeline, 0, "a", 0, 100)
+        second = put(timeline, 0, "a", 100, 100, src_in=100)
+        second.reversed = True
+
+        playlist = build_video_playlist(timeline, FakePool(), FakeProxies())
+        assert len(playlist.segments) == 2
+

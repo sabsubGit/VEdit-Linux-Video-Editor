@@ -15,10 +15,13 @@ Two conventions hold throughout:
 from __future__ import annotations
 
 import math
+from dataclasses import replace
 from typing import Iterable, Literal, Sequence
 
 from vedit.core.timebase import TimeBase
 from vedit.media.probe import MediaInfo
+from vedit.timeline.framing import ROTATIONS, Framing, Region
+from vedit.timeline.titles import Title
 from vedit.timeline.model import (
     MAX_GAIN_DB,
     MAX_SPEED,
@@ -32,6 +35,12 @@ from vedit.timeline.model import (
 )
 
 Edge = Literal["in", "out"]
+
+# Spare source a title pretends to have at each end, in frames. A title is drawn
+# rather than read, so the true answer is "as much as you like"; a finite number
+# keeps the trim arithmetic in integers, and an hour at 60 fps is longer than
+# anyone will drag a caption.
+TITLE_ROOM = 216_000
 
 
 # -- building clips from media ------------------------------------------------
@@ -175,10 +184,37 @@ def razor(timeline: Timeline, frame: int, tracks: Sequence[Track] | None = None)
             right_link = None
             if clip.link_id is not None:
                 right_link = rebound.setdefault(clip.link_id, new_id("l"))
+            # A reversed clip reads its window from the top down, so the piece
+            # that plays *second* is the lower part of the source, not the upper.
+            # Cutting on the raw offset would swap the two halves around.
+            if clip.reversed:
+                boundary = clip.src_out - source_offset
+                right_window = (clip.src_in, boundary)
+            else:
+                boundary = clip.src_in + source_offset
+                right_window = (boundary, clip.src_out)
+            # A moving framing is *divided* at the cut rather than copied to
+            # both halves: each half keeps the part of the move it covered, so
+            # cutting a push in leaves the picture doing exactly what it did
+            # before. Measured before the window is narrowed below, because
+            # that changes the clip's duration and so its progress.
+            at_cut = clip.framing_at(frame)
+            left_end = clip.framing_end if clip.moves else None
+            right_start = at_cut if clip.moves else clip.framing
+            # A zoom region is divided the same way, and for the same reason: a
+            # punch-in that spans the cut has to go on doing exactly what it was
+            # doing. Each half keeps its own share, ramps included, and a region
+            # falling wholly on one side goes only to that side.
+            left_zoom, right_zoom = _split_region(clip.zoom, frame - clip.tl_start)
+
+            # Everything else about the clip except its window carries across,
+            # so a cut is only ever a cut. Fades are the deliberate exception —
+            # they belong to the clip's own edges, and a right-hand half that
+            # restarted its fade in would be a fade in the middle of a shot.
             right = Clip(
                 media_id=clip.media_id,
-                src_in=clip.src_in + source_offset,
-                src_out=clip.src_out,
+                src_in=right_window[0],
+                src_out=right_window[1],
                 tl_start=frame,
                 src_length=clip.src_length,
                 kind=clip.kind,
@@ -186,13 +222,62 @@ def razor(timeline: Timeline, frame: int, tracks: Sequence[Track] | None = None)
                 link_id=right_link,
                 name=clip.name,
                 enabled=clip.enabled,
+                reversed=clip.reversed,
+                muted=clip.muted,
+                gain_db=clip.gain_db,
+                title=clip.title,
+                framing=right_start,
+                framing_end=left_end,
+                zoom=right_zoom,
+                # Not the dissolve: it belongs to this clip's head, and the
+                # right-hand half's head is the cut, which is not a transition.
+                rotation=clip.rotation,
+                flipped=clip.flipped,
             )
-            clip.src_out = clip.src_in + source_offset
+            if left_end is not None:
+                clip.framing_end = at_cut
+            clip.zoom = left_zoom
+            if clip.reversed:
+                clip.src_in = boundary
+            else:
+                clip.src_out = boundary
             track.clips.append(right)
             created.append(right)
         track.sort()
 
     return created
+
+
+def _split_region(region: Region | None, at: int) -> tuple[Region | None, Region | None]:
+    """One zoom region divided by a cut `at` frames into the clip.
+
+    The ramps go with the edges they belong to: the half holding the region's
+    start keeps the ramp in, the half holding its end keeps the ramp out, and
+    the raw edge each half gains at the cut has no ramp — which is right,
+    because at that frame the zoom is already part-way in and must not restart.
+    """
+    if region is None:
+        return None, None
+    if at <= region.start:
+        return None, replace(region, start=region.start - at, end=region.end - at)
+    if at >= region.end:
+        return region, None
+
+    left = Region(
+        region.framing,
+        start=region.start,
+        end=at,
+        ramp_in=min(region.ramp_in, at - region.start),
+        ramp_out=0,
+    )
+    right = Region(
+        region.framing,
+        start=0,
+        end=region.end - at,
+        ramp_in=0,
+        ramp_out=min(region.ramp_out, region.end - at),
+    )
+    return left, right
 
 
 # -- deletion -----------------------------------------------------------------
@@ -346,9 +431,22 @@ def _delta_bounds(timeline: Timeline, clip: Clip, edge: Edge) -> tuple[int, int]
 
     # Headroom is measured in source frames; a delta is in timeline frames. At
     # 2x, 100 spare source frames only buy 50 frames of timeline.
+    #
+    # `head_room`/`tail_room` are properties of the *source* window. A reversed
+    # clip plays that window backwards, so the material sitting before its first
+    # played frame is the source's tail, and the two swap.
     speed = clip.speed or 1.0
-    head_room_tl = int(clip.head_room / speed)
-    tail_room_tl = int(clip.tail_room / speed)
+    head, tail = clip.head_room, clip.tail_room
+    if clip.reversed:
+        head, tail = tail, head
+    if clip.is_title:
+        # A title is generated, not read: there is always more of it, so its
+        # length is whatever it is dragged to. Without this its source window —
+        # which `add_title` sizes to exactly the default length — reads as a
+        # clip with no spare footage, and the handles refuse to lengthen it.
+        head = tail = TITLE_ROOM
+    head_room_tl = int(head / speed)
+    tail_room_tl = int(tail / speed)
 
     if edge == "in":
         # Negative delta drags the in-point earlier, which needs head material.
@@ -387,15 +485,38 @@ def trim(timeline: Timeline, clip: Clip, edge: Edge, new_frame: int) -> int:
 
     for member in group:
         source_delta = member.source_span_for(delta)
-        if edge == "in":
+        if member.is_title:
+            # The window is synthetic, so it is resized to the new length rather
+            # than consumed. Written in terms of duration rather than by moving
+            # an edge of the window: a title that has been cut in two carries a
+            # window starting partway in, and re-anchoring that at zero without
+            # accounting for the offset would lengthen the clip by it.
+            length = member.duration + (-delta if edge == "in" else delta)
+            member.src_in = 0
+            member.src_out = member.src_length = member.source_span_for(length)
+            if edge == "in":
+                member.tl_start += delta
+            member.clamp_to_length()
+            continue
+        if member.reversed:
+            # Reading backwards, the timeline's in-edge is anchored to `src_out`
+            # and its out-edge to `src_in`, and dragging an edge later consumes
+            # *less* source, so the sign flips with it.
+            if edge == "in":
+                member.src_out = min(member.src_length, member.src_out - source_delta)
+                member.tl_start += delta
+            else:
+                member.src_in = max(0, member.src_in - source_delta)
+        elif edge == "in":
             member.src_in = max(0, member.src_in + source_delta)
             member.tl_start += delta
         else:
             member.src_out = min(member.src_length, member.src_out + source_delta)
-        # A trim can shorten a clip past its own fade. Left alone the fade would
-        # be longer than the clip it lives on and the playback envelope would run
-        # off the end of its own ramp.
-        member.clamp_fades()
+        # A trim can shorten a clip past its own fade, or out from under its
+        # own zoom region. Left alone the fade would be longer than the clip it
+        # lives on and the playback envelope would run off the end of its own
+        # ramp; the region would ask the export for frames that are not there.
+        member.clamp_to_length()
 
     for track in timeline.tracks:
         track.sort()
@@ -500,10 +621,46 @@ def set_speed(timeline: Timeline, clips: Sequence[Clip], speed: float) -> None:
             clip.src_out = min(
                 clip.src_length, clip.src_in + max(1, clip.source_span_for(available))
             )
+        # A retime changes how long the clip plays for without touching its
+        # source window, so anything measured in timeline frames — the fades,
+        # the zoom region — has to be pulled back inside the new length.
+        clip.clamp_to_length()
 
 
 def clip_speed(timeline: Timeline, clip: Clip) -> float:
     return clip.speed
+
+
+# -- direction ----------------------------------------------------------------
+
+
+def set_reversed(timeline: Timeline, clips: Sequence[Clip], backwards: bool) -> list[Clip]:
+    """Play the clips' source windows back to front, or forwards again.
+
+    Applied to the whole link group, like a retime: picture and sound have to
+    turn round together or the take falls apart.
+
+    Nothing about the clip's *timeline* geometry changes — same start, same
+    length, same neighbours — because reversing only changes the order the same
+    source frames are read in. That is what makes it safe to toggle on a clip
+    sitting between two others.
+    """
+    group = expand_links(timeline, clips)
+    if not group:
+        return []
+    _assert_unlocked(timeline, group)
+
+    for clip in group:
+        clip.reversed = bool(backwards)
+    return group
+
+
+def toggle_reversed(timeline: Timeline, clips: Sequence[Clip]) -> list[Clip]:
+    """Flip direction, taking the first clip's state as the one to invert."""
+    group = list(clips)
+    if not group:
+        return []
+    return set_reversed(timeline, group, not group[0].reversed)
 
 
 # -- levels -------------------------------------------------------------------
@@ -530,6 +687,35 @@ def set_clip_gain(timeline: Timeline, clips: Sequence[Clip], gain_db: float) -> 
     for clip in targets:
         clip.gain_db = gain_db
     return targets
+
+
+def set_clip_muted(timeline: Timeline, clips: Sequence[Clip], muted: bool) -> list[Clip]:
+    """Silence the audio clips of a selection without removing them.
+
+    Unlike gain and fades, this *does* expand the link group first, and then
+    keeps only the audio members. That is the difference between an operation
+    describing a level — which a video clip has no meaning for — and one
+    describing whether a cut is heard: right-clicking the picture half of a
+    linked pair on the Edit page and asking to mute it can only sensibly mean
+    "mute the sound that belongs to this", so it does.
+    """
+    targets = _audio_only(expand_links(timeline, clips))
+    if not targets:
+        return []
+    _assert_unlocked(timeline, targets)
+
+    for clip in targets:
+        clip.muted = bool(muted)
+    return targets
+
+
+def toggle_clip_mute(timeline: Timeline, clips: Sequence[Clip]) -> list[Clip]:
+    """Flip mute on a selection, taking its first audio clip as the state to
+    invert so a mixed selection ends up uniform rather than checkerboarded."""
+    targets = _audio_only(expand_links(timeline, clips))
+    if not targets:
+        return []
+    return set_clip_muted(timeline, targets, not targets[0].muted)
 
 
 def normalise_clips(timeline: Timeline, clips: Sequence[Clip], gains: dict[str, float]) -> list[Clip]:
@@ -630,3 +816,340 @@ def clear_track(timeline: Timeline, track: Track) -> None:
     # Linked partners on other lanes are left alone: clearing V2 should not
     # silently delete audio the user can still see on A1.
     track.clips.clear()
+
+
+# -- the picture ---------------------------------------------------------------
+
+
+def _video_only(clips: Sequence[Clip]) -> list[Clip]:
+    """The picture members of a selection, links expanded first.
+
+    The mirror of `_audio_only`, but it expands the way mute does rather than
+    the way gain does. Reframing is aimed at a shot, and a shot on the timeline
+    is usually a linked pair — so grabbing either half and reframing should
+    reach the picture. Gain cannot work that way because a video clip has no
+    level to set; a framing has exactly one place to land.
+    """
+    return [clip for clip in clips if clip.kind == "video"]
+
+
+def set_framing(
+    timeline: Timeline, clips: Sequence[Clip], framing: Framing
+) -> list[Clip]:
+    """Set which part of the frame the picture fills."""
+    targets = _video_only(expand_links(timeline, clips))
+    if not targets:
+        return []
+    _assert_unlocked(timeline, targets)
+
+    for clip in targets:
+        clip.framing = framing
+    return targets
+
+
+def set_rotation(timeline: Timeline, clips: Sequence[Clip], rotation: int) -> list[Clip]:
+    """Turn the picture by a quarter turn multiple, clockwise."""
+    rotation = int(rotation) % 360
+    if rotation not in ROTATIONS:
+        raise TimelineError(f"{rotation}° is not a quarter turn")
+
+    targets = _video_only(expand_links(timeline, clips))
+    if not targets:
+        return []
+    _assert_unlocked(timeline, targets)
+
+    for clip in targets:
+        clip.rotation = rotation
+    return targets
+
+
+def rotate_clips(timeline: Timeline, clips: Sequence[Clip], quarters: int) -> list[Clip]:
+    """Turn by `quarters` steps from wherever the clips already are.
+
+    Led by the first clip, the way `toggle_reversed` is: a mixed selection
+    should end up agreeing rather than each member keeping its own offset.
+    """
+    targets = _video_only(expand_links(timeline, clips))
+    if not targets:
+        return []
+    current = targets[0].rotation
+    return set_rotation(timeline, targets, (current + 90 * int(quarters)) % 360)
+
+
+def set_flipped(timeline: Timeline, clips: Sequence[Clip], flipped: bool) -> list[Clip]:
+    """Mirror the picture left to right."""
+    targets = _video_only(expand_links(timeline, clips))
+    if not targets:
+        return []
+    _assert_unlocked(timeline, targets)
+
+    for clip in targets:
+        clip.flipped = bool(flipped)
+    return targets
+
+
+def toggle_flipped(timeline: Timeline, clips: Sequence[Clip]) -> list[Clip]:
+    targets = _video_only(expand_links(timeline, clips))
+    if not targets:
+        return []
+    return set_flipped(timeline, targets, not targets[0].flipped)
+
+
+def reset_framing(timeline: Timeline, clips: Sequence[Clip]) -> list[Clip]:
+    """Put the picture back to untouched — framing, rotation and flip together.
+
+    One action rather than three, because "put it back how it was" is one
+    thought, and a Reset that left the clip still upside down would be a
+    surprise.
+    """
+    targets = _video_only(expand_links(timeline, clips))
+    if not targets:
+        return []
+    _assert_unlocked(timeline, targets)
+
+    for clip in targets:
+        clip.framing = Framing()
+        clip.framing_end = None
+        clip.zoom = None
+        clip.rotation = 0
+        clip.flipped = False
+    return targets
+
+
+def set_zoom_region(
+    timeline: Timeline,
+    clips: Sequence[Clip],
+    region: Region | None,
+) -> list[Clip]:
+    """Punch in for part of a clip, or take the punch-in away.
+
+    Clip-local frames, so the region stays put when the clip is dragged along
+    the timeline, and clamped to the clip so a region set before a trim cannot
+    outlive the frames it was drawn over.
+    """
+    targets = _video_only(expand_links(timeline, clips))
+    if not targets:
+        return []
+    _assert_unlocked(timeline, targets)
+
+    for clip in targets:
+        clip.zoom = region
+        clip.clamp_zoom()
+    return targets
+
+
+def zoom_region_for(
+    clip: Clip, at_frame: int, framing: Framing, *, frames: int
+) -> Region:
+    """A region of `frames` centred on a timeline frame, fitted to the clip.
+
+    Centred rather than started there because the moment being zoomed into is
+    the one under the playhead — starting the punch-in at it would show the
+    approach and miss the event.
+    """
+    local = at_frame - clip.tl_start
+    half = max(1, frames) // 2
+    start = max(0, min(local - half, max(0, clip.duration - 1)))
+    end = min(clip.duration, max(start + 1, start + max(1, frames)))
+    return Region(framing, start, end).clamped_to(clip.duration)
+
+
+def set_zoom_ramp(
+    timeline: Timeline, clips: Sequence[Clip], edge: Edge, frames: int
+) -> list[Clip]:
+    """How long the zoom takes to arrive at one end. Zero is a cut.
+
+    Clamped rather than rejected for the same reason a fade is: it is set by
+    dragging a corner, and the mouse goes where it likes.
+    """
+    targets = [clip for clip in _video_only(expand_links(timeline, clips)) if clip.zoom]
+    if not targets:
+        return []
+    _assert_unlocked(timeline, targets)
+
+    for clip in targets:
+        region = clip.zoom
+        other = region.ramp_out if edge == "in" else region.ramp_in
+        room = max(0, region.length - other)
+        wanted = max(0, min(int(frames), room))
+        clip.zoom = replace(
+            region, **{"ramp_in" if edge == "in" else "ramp_out": wanted}
+        )
+    return targets
+
+
+def set_framing_move(
+    timeline: Timeline, clips: Sequence[Clip], end: Framing | None
+) -> list[Clip]:
+    """Give the framing somewhere to travel to, or take the travel away.
+
+    `None` removes the move and leaves the clip on its starting framing, which
+    is what "Remove Move" means: stop moving, stay where you began.
+    """
+    targets = _video_only(expand_links(timeline, clips))
+    if not targets:
+        return []
+    _assert_unlocked(timeline, targets)
+
+    for clip in targets:
+        clip.framing_end = end
+    return targets
+
+
+# -- transitions ---------------------------------------------------------------
+
+
+def set_dissolve(timeline: Timeline, clip: Clip, frames: int) -> int:
+    """Cross-fade into `clip` from the shot before it. Returns the length set.
+
+    Stored on the incoming clip and paid for out of the outgoing one's unused
+    source, so the two still abut and neither moves: adding a transition never
+    changes where anything is or how long the edit runs.
+
+    The picture dissolves; the sound cross-fades to match, by putting a fade out
+    on the outgoing audio and a fade in on the incoming one over the same span.
+    That is what a dissolve sounds like, and it needs nothing the mixer does not
+    already do.
+    """
+    if clip.kind != "video":
+        raise TimelineError("a dissolve is a picture transition")
+
+    track = timeline.track_of(clip)
+    _assert_unlocked(timeline, [clip])
+
+    wanted = max(0, int(frames))
+    if wanted == 0:
+        clip.dissolve_in = 0
+        _mirror_dissolve_in_audio(timeline, track, clip, 0)
+        return 0
+
+    index = track.index_of(clip)
+    if index == 0:
+        raise TimelineError("nothing before this clip to dissolve from")
+    outgoing = track.clips[index - 1]
+    if outgoing.tl_end != clip.tl_start:
+        raise TimelineError("close the gap before the clip to dissolve into it")
+    _assert_unlocked(timeline, [outgoing])
+
+    clip.dissolve_in = wanted
+    usable = track.dissolve_before(clip)
+    if usable is None:
+        clip.dissolve_in = 0
+        raise TimelineError(
+            f"{outgoing.name or 'the clip before'} has no unused footage left to "
+            "dissolve from — trim its end back to make room"
+        )
+
+    clip.dissolve_in = usable[1]
+    _mirror_dissolve_in_audio(timeline, track, clip, usable[1])
+    return usable[1]
+
+
+def _mirror_dissolve_in_audio(
+    timeline: Timeline, track: Track, clip: Clip, frames: int
+) -> None:
+    """Match a picture dissolve with a cross-fade on the linked sound.
+
+    Audio clips abut just as tightly as the picture does, so there is no overlap
+    to mix across — but a fade out of one against a fade in of the next over the
+    same span is the same thing to the ear, and rides on the fades the mixer and
+    the exporter already understand.
+    """
+    for partner in timeline.linked_group(clip):
+        if partner.kind == "audio":
+            partner.fade_in = min(frames, partner.duration)
+            partner.clamp_fades()
+
+    index = track.index_of(clip)
+    if index == 0:
+        return
+    for partner in timeline.linked_group(track.clips[index - 1]):
+        if partner.kind == "audio":
+            partner.fade_out = min(frames, max(0, partner.duration - partner.fade_in))
+            partner.clamp_fades()
+
+
+def clear_dissolves(timeline: Timeline, clips: Sequence[Clip]) -> list[Clip]:
+    touched = []
+    for clip in clips:
+        if clip.kind == "video" and clip.dissolve_in:
+            set_dissolve(timeline, clip, 0)
+            touched.append(clip)
+    return touched
+
+
+# Long enough to register as a punch-in rather than a glitch, short enough to
+# read as "for a moment". Dragged from there.
+DEFAULT_ZOOM_SECONDS = 2.0
+
+
+# -- titles --------------------------------------------------------------------
+
+# Long enough to read, short enough that it is obviously meant to be adjusted.
+DEFAULT_TITLE_SECONDS = 3.0
+
+
+def add_title(
+    timeline: Timeline,
+    frame: int,
+    *,
+    title: Title | None = None,
+    track: Track | None = None,
+    frames: int | None = None,
+) -> Clip:
+    """Put a title on the timeline at `frame`.
+
+    It goes on the *highest* free video lane by default rather than the first
+    one, because a title is nearly always meant to sit over a shot rather than
+    replace it — and a lane that already has picture on it is the one place it
+    must not land.
+    """
+    if frame < 0:
+        raise TimelineError("cannot place a title before the start of the timeline")
+
+    length = frames if frames is not None else max(
+        1, int(round(DEFAULT_TITLE_SECONDS * float(timeline.timebase.fps)))
+    )
+    if track is None:
+        track = _free_video_lane(timeline, frame, length)
+
+    clip = Clip(
+        media_id="",
+        src_in=0,
+        src_out=length,
+        tl_start=frame,
+        src_length=length,
+        kind="video",
+        name=(title or Title()).text.split("\n")[0][:40] or "Title",
+        title=title or Title(),
+    )
+    if track.locked:
+        raise TimelineError(f"track {track.name} is locked")
+    track.insert(clip)
+    return clip
+
+
+def _free_video_lane(timeline: Timeline, frame: int, length: int) -> Track:
+    """A lane above the picture with room for a title, adding one if need be.
+
+    Titles go on their own lane and a new one is made rather than squeezing in
+    beside a shot, because a title you can drag along and stretch is only
+    draggable if there is empty lane either side of it. Reusing a half-full lane
+    gives you a title wedged between two clips, which is the one shape that
+    cannot be adjusted.
+    """
+    lanes = timeline.video_tracks
+    for track in lanes[1:]:
+        if not track.locked and track.would_overlap(frame, frame + length) is None:
+            return track
+    return timeline.add_track("video")
+
+
+def set_title(timeline: Timeline, clip: Clip, title: Title) -> Clip:
+    """Rewrite a title's words and look."""
+    if not clip.is_title:
+        raise TimelineError("that clip is not a title")
+    _assert_unlocked(timeline, [clip])
+    clip.title = title
+    clip.name = title.text.split("\n")[0][:40] or "Title"
+    return clip

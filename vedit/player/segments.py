@@ -30,12 +30,20 @@ class Segment:
     media_id: str = ""
     speed: float = 1.0
     clip_id: str = ""
+    # Read the source backwards. `src_start` still means "the source position
+    # playing at tl_start" — for a reversed segment that is the *far* edge of the
+    # window, and time walks down from it rather than up.
+    reversed: bool = False
     # Level shaping, carried here so the audio thread never has to look a clip
     # up. Gain is linear rather than dB: the mixer applies it once per block and
     # has no business doing a pow() in the hot path.
     gain: float = 1.0
     fade_in: int = 0       # timeline frames from tl_start
     fade_out: int = 0      # timeline frames ending at tl_end
+    # How far into a cross dissolve this segment sits, so the viewer can mix
+    # the outgoing shot under it. Zero for everything that is not a transition.
+    dissolve: int = 0
+    dissolve_from: int = 0   # timeline frame the dissolve began at
 
     @property
     def duration(self) -> int:
@@ -50,11 +58,15 @@ class Segment:
         played = timeline_frame - self.tl_start
         if self.speed != 1.0:
             played = int(round(played * self.speed))
+        if self.reversed:
+            played = -played
         return float(timebase.frames_to_seconds(self.src_start + played))
 
     def timeline_frame_for(self, source_seconds: float, timebase: TimeBase) -> int:
         """Inverse of `source_seconds`: which timeline frame a decoded frame is for."""
         source_frame = timebase.seconds_to_frames(source_seconds) - self.src_start
+        if self.reversed:
+            source_frame = -source_frame
         if self.speed != 1.0:
             source_frame = source_frame / self.speed
         return self.tl_start + int(round(source_frame))
@@ -120,7 +132,11 @@ def build_playlist(
 
         info = pool.info_for(clip.media_id)
         path = None
-        if info is not None and clip.enabled and not track.muted:
+        # A muted audio clip is turned into a gap rather than decoded and
+        # multiplied by zero: the segment still occupies its span, so everything
+        # downstream stays aligned, and nothing is read from disk for it.
+        playable = clip.audible if clip.kind == "audio" else clip.enabled
+        if info is not None and playable and not track.muted:
             path = proxies.playback_path(info) if use_proxies else info.path
 
         segments.append(
@@ -128,10 +144,11 @@ def build_playlist(
                 tl_start=clip.tl_start,
                 tl_end=clip.tl_end,
                 path=path,
-                src_start=clip.src_in,
+                src_start=clip.source_frame_at(clip.tl_start),
                 media_id=clip.media_id,
                 speed=clip.speed,
                 clip_id=clip.clip_id,
+                reversed=clip.reversed,
                 gain=from_db(clip.gain_db) if clip.kind == "audio" else 1.0,
                 fade_in=clip.fade_in if clip.kind == "audio" else 0,
                 fade_out=clip.fade_out if clip.kind == "audio" else 0,
@@ -171,6 +188,9 @@ def build_video_playlist(
         for clip in track.clips:
             edges.add(max(0, min(clip.tl_start, duration)))
             edges.add(max(0, min(clip.tl_end, duration)))
+            found = track.dissolve_before(clip)
+            if found is not None:
+                edges.add(max(0, min(clip.tl_start + found[1], duration)))
     boundaries = sorted(edges)
 
     segments: list[Segment] = []
@@ -178,11 +198,14 @@ def build_video_playlist(
         if end <= start:
             continue
         winner: Clip | None = None
-        # Later lanes are higher, so the last match wins.
+        winning_track: Track | None = None
+        # Later lanes are higher, so the last match wins. A title is skipped:
+        # it is words drawn over a picture, not a picture, so it must not
+        # occlude the lane below the way a shot would.
         for track in lanes:
             found = track.clip_at(start)
-            if found is not None and found.enabled:
-                winner = found
+            if found is not None and found.enabled and not found.is_title:
+                winner, winning_track = found, track
 
         if winner is None:
             segments.append(Segment(start, end, None, 0))
@@ -192,6 +215,11 @@ def build_video_playlist(
         path = None
         if info is not None:
             path = proxies.playback_path(info) if use_proxies else info.path
+
+        dissolve = 0
+        found = winning_track.dissolve_before(winner) if winning_track else None
+        if found is not None and start < winner.tl_start + found[1]:
+            dissolve = found[1]
 
         segments.append(
             Segment(
@@ -204,10 +232,19 @@ def build_video_playlist(
                 media_id=winner.media_id,
                 speed=winner.speed,
                 clip_id=winner.clip_id,
+                reversed=winner.reversed,
+                dissolve=dissolve,
+                dissolve_from=winner.tl_start,
             )
         )
 
     return Playlist(_merge_adjacent(segments), duration)
+
+
+def _consumed(segment: Segment) -> int:
+    """Signed source frames a segment gets through — negative when reversed."""
+    span = int(round((segment.tl_end - segment.tl_start) * segment.speed))
+    return -span if segment.reversed else span
 
 
 def _merge_adjacent(segments: list[Segment]) -> list[Segment]:
@@ -226,14 +263,17 @@ def _merge_adjacent(segments: list[Segment]) -> list[Segment]:
                 and last.path == segment.path
                 and last.media_id == segment.media_id
                 and last.speed == segment.speed
+                and last.reversed == segment.reversed
                 # Same clip, not merely the same file: two pieces of one clip can
                 # be rejoined, two different clips of the same source cannot,
                 # because they may carry different gain or fades.
                 and last.clip_id == segment.clip_id
+                # A transition looks different from the rest of its own clip,
+                # so the span it covers has to stay its own segment.
+                and last.dissolve == segment.dissolve
                 and (
                     segment.is_gap
-                    or last.src_start + int(round((last.tl_end - last.tl_start) * last.speed))
-                    == segment.src_start
+                    or last.src_start + _consumed(last) == segment.src_start
                 )
             )
             if continuous:
@@ -260,3 +300,72 @@ def audio_playlists(
         for track in timeline.audible_audio_tracks()
         if track.clips
     ]
+
+
+def build_dissolve_playlist(
+    timeline: Timeline,
+    pool: MediaPool,
+    proxies: ProxyManager,
+    *,
+    use_proxies: bool = True,
+) -> Playlist:
+    """The *outgoing* half of every cross dissolve, and gaps everywhere else.
+
+    A second playlist rather than something folded into the first, because a
+    dissolve is the one moment two shots are on screen at once and the decoder
+    reads one file at a time. Fed to its own decoder, this one sits idle on gaps
+    for the whole timeline except during transitions — so the cost is paid only
+    where there is actually a transition to show.
+
+    Each segment reads the outgoing clip *past its own out-point*, into the
+    unused source the dissolve is spending. `source_frame_at` maps that without
+    needing to know it is being asked for something beyond the clip's end.
+    """
+    duration = timeline.duration
+    segments: list[Segment] = []
+    cursor = 0
+
+    spans: list[tuple[int, int, Clip]] = []
+    for track in timeline.video_tracks:
+        if track.muted:
+            continue
+        for clip in track.clips:
+            if not clip.enabled:
+                continue
+            found = track.dissolve_before(clip)
+            if found is None:
+                continue
+            outgoing, frames = found
+            if outgoing.enabled:
+                spans.append((clip.tl_start, clip.tl_start + frames, outgoing))
+    spans.sort()
+
+    for start, end, outgoing in spans:
+        if start < cursor:
+            # Two dissolves cannot overlap on one lane, but two lanes can each
+            # have one at the same moment. Only the first is shown, matching
+            # the render, which mixes into whichever clip is on top.
+            continue
+        if start > cursor:
+            segments.append(Segment(cursor, start, None, 0))
+        info = pool.info_for(outgoing.media_id)
+        path = None
+        if info is not None:
+            path = proxies.playback_path(info) if use_proxies else info.path
+        segments.append(
+            Segment(
+                tl_start=start,
+                tl_end=end,
+                path=path,
+                src_start=outgoing.source_frame_at(outgoing.tl_end),
+                media_id=outgoing.media_id,
+                speed=outgoing.speed,
+                clip_id=outgoing.clip_id,
+                reversed=outgoing.reversed,
+            )
+        )
+        cursor = end
+
+    if cursor < duration:
+        segments.append(Segment(cursor, duration, None, 0))
+    return Playlist(segments, duration)

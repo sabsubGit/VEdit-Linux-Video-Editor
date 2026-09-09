@@ -193,9 +193,11 @@ class TestMixingFields:
         restored = loaded.audio_tracks[0].clips[0]
         assert (restored.gain_db, restored.fade_in, restored.fade_out) == (4.5, 12, 8)
 
-    def test_the_written_version_is_two(self, project):
+    def test_the_written_version_is_the_current_one(self, project):
+        """Pinned deliberately: the number only moves when a field is added that
+        an older build would drop on the next save."""
         timeline, media = project
-        assert project_to_dict(timeline, media)["version"] == 2
+        assert project_to_dict(timeline, media)["version"] == 5
 
     def test_a_version_one_file_loads_with_everything_at_unity(self, project, tmp_path):
         """Forward compatibility: the new fields all default to "as it was", so

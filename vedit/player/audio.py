@@ -47,6 +47,12 @@ SAMPLE_RATE = 48000
 CHANNELS = 2
 BYTES_PER_FRAME = CHANNELS * 2      # int16 stereo
 TARGET_BUFFER_SECONDS = 0.6         # how far ahead the decoder works
+# A reversed clip is read in spans this long and flipped in memory. Long enough
+# that the seek at the head of each one is amortised, short enough that a lane
+# never holds more than a couple of hundred kilobytes of flipped audio no matter
+# how long the clip is.
+REVERSE_SPAN_SECONDS = 0.5
+REVERSE_BLOCK = 4096                # sample-frames handed out at a time
 
 
 def envelope(
@@ -204,6 +210,11 @@ class _LaneReader:
         self._stream = None
         self._seek_target = 0.0
         self._sample_pos = self.samples_at(start_frame)
+        # Reversed segments only: audio already decoded and flipped, waiting to
+        # be handed out, and how far down the source the flip has got to.
+        self._reversed_pending = np.zeros(0, dtype=np.float32)
+        self._reversed_top = 0.0     # source seconds; the next span ends here
+        self._reversed_floor = 0.0   # source seconds; the segment stops here
 
     # -- position --------------------------------------------------------------
 
@@ -233,6 +244,7 @@ class _LaneReader:
             self._container = None
         self._frames = None
         self._segment = None
+        self._reversed_pending = np.zeros(0, dtype=np.float32)
 
     # -- reading ---------------------------------------------------------------
 
@@ -300,7 +312,8 @@ class _LaneReader:
         segment_start = float(self.timebase.frames_to_seconds(segment.tl_start))
         into_segment = max(0.0, self.elapsed_seconds - segment_start)
         source_start = float(self.timebase.frames_to_seconds(segment.src_start))
-        return source_start + into_segment * segment.speed
+        travelled = into_segment * segment.speed
+        return source_start - travelled if segment.reversed else source_start + travelled
 
     def _open(self, segment: Segment) -> bool:
         self.close()
@@ -326,9 +339,18 @@ class _LaneReader:
         self._frames = container.decode(stream)
         self._resampler = av.AudioResampler(format="s16", layout="stereo", rate=SAMPLE_RATE)
         self._seek_target = seconds
+        if segment.reversed:
+            self._reversed_pending = np.zeros(0, dtype=np.float32)
+            # Playing backwards, "where we are now" is the *top* of the span
+            # still to be read, and the segment ends at its lower edge.
+            self._reversed_top = seconds
+            self._reversed_floor = segment.source_seconds(segment.tl_end, self.timebase)
         return True
 
     def _next_block(self, segment: Segment) -> np.ndarray | None:
+        if segment.reversed:
+            return self._next_block_reversed(segment)
+
         end_seconds = segment.source_seconds(segment.tl_end, self.timebase)
         while True:
             try:
@@ -365,6 +387,90 @@ class _LaneReader:
             # Count exactly what was produced. Anything else drifts.
             self._sample_pos += produced
             return data
+
+    # -- reverse ---------------------------------------------------------------
+
+    def _next_block_reversed(self, segment: Segment) -> np.ndarray | None:
+        """One block of a clip playing backwards.
+
+        Decoders only run forwards, so a span of source is decoded normally,
+        flipped, and then handed out in ordinary-sized blocks. Spans are read
+        from the top of the window down, which keeps the memory bounded however
+        long the clip is — the alternative, buffering the whole clip the way the
+        renderer's `areverse` does, would be unbounded on exactly the takes
+        people reverse.
+
+        The joins between spans are sample-exact; what they cannot carry across
+        is the decoder's own filter state, so a span boundary can be a faint
+        tick on dense material. Preview only — the render reverses the clip in
+        one piece.
+        """
+        if self._reversed_pending.size == 0:
+            span = self._read_reversed_span(segment)
+            if span is None:
+                return None
+            self._reversed_pending = span
+
+        take = min(REVERSE_BLOCK * CHANNELS, self._reversed_pending.size)
+        data = self._reversed_pending[:take]
+        self._reversed_pending = self._reversed_pending[take:]
+
+        produced = data.size // CHANNELS
+        data = self._shape(data, segment, produced)
+        self._sample_pos += produced
+        return data
+
+    def _read_reversed_span(self, segment: Segment) -> np.ndarray | None:
+        """Decode the next span down the source and flip it. None when spent."""
+        # A fraction of a sample-frame left is nothing; stop rather than seek
+        # for it.
+        if self._reversed_top - self._reversed_floor < 1.0 / SAMPLE_RATE:
+            return None
+
+        top = self._reversed_top
+        bottom = max(self._reversed_floor, top - REVERSE_SPAN_SECONDS)
+        self._reversed_top = bottom
+
+        data = self._decode_span(bottom, top)
+        if data is None or data.size == 0:
+            return None
+
+        if segment.speed != 1.0:
+            data = self._retime(data, segment.speed)
+        return data.reshape(-1, CHANNELS)[::-1].reshape(-1)
+
+    def _decode_span(self, start: float, end: float) -> np.ndarray | None:
+        """Forward-decode `[start, end)` source seconds as float32 stereo."""
+        if self._container is None or self._stream is None:
+            return None
+        try:
+            self._container.seek(
+                int(start / float(self._stream.time_base)), stream=self._stream, backward=True
+            )
+        except (av.error.FFmpegError, OSError):
+            return None
+        self._frames = self._container.decode(self._stream)
+
+        pieces: list[np.ndarray] = []
+        for frame in self._frames:
+            frame_seconds = float((frame.pts or 0) * self._stream.time_base)
+            if frame_seconds >= end:
+                break
+            length = float(frame.samples) / float(frame.rate or SAMPLE_RATE)
+            if frame_seconds + length <= start:
+                continue
+
+            resampled = self._resampler.resample(frame)
+            if not resampled:
+                continue
+            block = np.concatenate([self._flatten(r.to_ndarray()) for r in resampled])
+            block = self._trim(block, frame_seconds, start, end)
+            if block.size:
+                pieces.append(block.astype(np.float32))
+
+        if not pieces:
+            return None
+        return np.concatenate(pieces) if len(pieces) > 1 else pieces[0]
 
     def _shape(self, data: np.ndarray, segment: Segment, produced: int) -> np.ndarray:
         """Apply the clip's own gain and fades to a decoded block.
@@ -565,6 +671,7 @@ def _signature(playlists: list[Playlist]) -> tuple:
                     segment.path,
                     segment.src_start,
                     segment.speed,
+                    segment.reversed,
                     segment.gain,
                     segment.fade_in,
                     segment.fade_out,
@@ -680,6 +787,12 @@ class AudioStreamer:
     def stop(self) -> None:
         self._stop.set()
         if self._sink is not None:
+            # `reset` before `stop`, and the order matters. `stop` lets the
+            # device finish what it has already been handed, which on a sink
+            # holding 150 ms plus whatever the OS has queued means sound
+            # carrying on for a moment after the user hit pause. `reset`
+            # discards it instead, so pause is immediate.
+            self._sink.reset()
             self._sink.stop()
             self._sink = None
         if self._device is not None:

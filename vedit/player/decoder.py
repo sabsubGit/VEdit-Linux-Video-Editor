@@ -14,6 +14,7 @@ code still works, just less briskly.
 from __future__ import annotations
 
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -26,6 +27,27 @@ from vedit.core.timebase import TimeBase
 from vedit.player.segments import Playlist, Segment
 
 QUEUE_DEPTH = 8
+
+# How far behind the frame being asked for the decoder may fall before it stops
+# turning what it decodes into images. Long enough to ride out a hiccup, short
+# enough that the picture is never visibly stale.
+LATE_SECONDS = 0.33
+# Further behind than this and walking the stream will never close the gap, so
+# seek instead and accept the keyframe run-up. Two seconds, because a seek on
+# long-GOP media costs more than decoding a handful of frames and thrashing
+# between the two would be worse than either.
+SKIP_SECONDS = 2.0
+# The least time between two catch-up seeks. On media that cannot be decoded in
+# real time the seek does not close the gap — the run-up costs more than the
+# time it saves — so it comes due again immediately, and left ungated the
+# decoder spends the whole of playback seeking and delivers almost nothing.
+SKIP_INTERVAL_SECONDS = 3.0
+# The most frames in a row that may be decoded without being converted. Skipping
+# the conversion helps the decoder catch up, but only if it *can*: if it cannot,
+# an ungated rule discards every frame for ever and the viewer freezes on
+# whatever was last handed to it. Past this many, one gets through regardless —
+# a picture running behind is worth having, a still one is not.
+MAX_DROPPED_RUN = 4
 
 
 @dataclass(slots=True)
@@ -65,9 +87,15 @@ class _OpenSource:
     def __init__(self, path: Path) -> None:
         self.container = av.open(str(path))
         self.stream = self.container.streams.video[0]
-        # Frame-level threading adds latency after a seek; slice threading gives
-        # most of the speed-up without it.
-        self.stream.thread_type = "SLICE"
+        # Frame-level threading as well as slice, which is worth three to six
+        # times the sequential decode rate: on a 1080p60 source a frame costs
+        # 0.56 ms rather than 3.48 ms, and on a 540p proxy 0.18 ms rather than
+        # 0.69 ms. This was `SLICE` alone on the theory that frame threading
+        # delays the first frame after a seek; measured, it does not — a seek
+        # plus one frame is 3.69 ms against 3.53 ms on a proxy, and slightly
+        # *faster* on the original. The scrub is what that theory was
+        # protecting and it is not paying for this.
+        self.stream.thread_type = "AUTO"
         self.stream.thread_count = 0
         self._frames = None
 
@@ -115,6 +143,20 @@ class VideoDecoder:
         self._source_path: Path | None = None
         self._segment: Segment | None = None
 
+        # The frame the viewer last asked for. Without it the decode thread has
+        # no idea the clock has moved on: it walks the stream frame by frame,
+        # and on media it cannot decode in real time it falls behind and stays
+        # behind, for ever. See `_lateness`.
+        self._wanted: int | None = None
+        # Catch-up state: when the last skip-seek happened, and how many frames
+        # in a row have been decoded without being shown. Both exist to stop the
+        # cure being worse than the disease; see the constants above.
+        self._last_skip = 0.0
+        self._dropped_run = 0
+        fps = float(timebase.fps)
+        self._late_frames = max(2, int(round(LATE_SECONDS * fps)))
+        self._skip_frames = max(self._late_frames * 2, int(round(SKIP_SECONDS * fps)))
+
     # -- lifecycle -------------------------------------------------------------
 
     def start(self) -> None:
@@ -140,6 +182,7 @@ class VideoDecoder:
             self._playlist = playlist
             self._queue.clear()
             self._seek_to = position
+            self._wanted = None
             self._generation += 1
             self._at_end = False
             self._wake.notify_all()
@@ -148,6 +191,11 @@ class VideoDecoder:
         with self._wake:
             self._seek_to = max(0, frame)
             self._queue.clear()
+            # Cleared, not carried: a request from before the jump says nothing
+            # about where we are going, and left in place it would read as being
+            # hopelessly behind and trigger an immediate skip back.
+            self._wanted = None
+            self._dropped_run = 0
             self._generation += 1
             self._at_end = False
             self._wake.notify_all()
@@ -171,6 +219,9 @@ class VideoDecoder:
         picture should skip to stay with the clock, not drift further back.
         """
         with self._wake:
+            # Recorded even when nothing is waiting: this is the only channel by
+            # which the decode thread learns where playback has actually got to.
+            self._wanted = frame_index
             chosen: DecodedFrame | None = None
             while self._queue and self._queue[0].frame_index <= frame_index:
                 chosen = self._queue.pop(0)
@@ -257,33 +308,102 @@ class VideoDecoder:
                     self._queue.append(DecodedFrame(target, QImage()))
             return
 
-        # Decode forward from the keyframe to the exact requested frame.
+        if not self._decode_at(segment, target, generation):
+            with self._wake:
+                if generation == self._generation:
+                    self._at_end = True
+
+    def _decode_at(self, segment: Segment, target: int, generation: int) -> bool:
+        """Queue the one frame that plays at `target`, from an already-seeked source.
+
+        Decodes forward from the keyframe the seek landed on and takes the first
+        frame at or after the wanted source time. False if the source ran out
+        before reaching it.
+        """
         assert self._source is not None
+        frame_duration = float(self.timebase.frame_duration())
         wanted = segment.source_seconds(target, self.timebase)
-        tolerance = float(self.timebase.frame_duration()) / 2
+        if segment.reversed:
+            # `source_seconds` gives the source *boundary* that timeline frame
+            # sits at — for a reversed segment that is the top of the frame
+            # playing there, so the frame itself starts one duration earlier.
+            # Without this the very first frame back is one past the end of the
+            # source and never arrives.
+            wanted -= frame_duration
+        tolerance = frame_duration / 2
 
         for frame in self._source.frames():
             if self._generation != generation:
-                return
+                return True
             position = self._source.seconds_of(frame)
             if position + tolerance < wanted:
                 continue
-            index = segment.timeline_frame_for(position, self.timebase)
+            # Reversed decoding asks for one specific frame and gets it; the
+            # forward path decodes a run and lets each frame say where it goes.
+            index = target if segment.reversed else segment.timeline_frame_for(
+                position, self.timebase
+            )
             with self._wake:
                 if generation != self._generation:
-                    return
+                    return True
                 self._queue.append(DecodedFrame(max(index, segment.tl_start), _to_qimage(frame)))
-                self._position = index + 1
+                self._position = max(index, target) + 1
                 self._wake.notify_all()
-            return
+            return True
 
-        with self._wake:
-            if generation == self._generation:
-                self._at_end = True
+        return False
+
+    def _lateness(self, position: int) -> int:
+        """How many frames behind the viewer's last request the decoder is.
+
+        Negative — the normal, healthy case — means it is running ahead and
+        filling the queue. Positive means frames are being decoded that the
+        clock has already gone past, and every one of them is wasted work that
+        makes the next one later still.
+        """
+        with self._lock:
+            wanted = self._wanted
+        return None if wanted is None else wanted - position
 
     def _decode_one(self, playlist: Playlist, generation: int) -> None:
         position = self._position
         segment = self._segment
+
+        # Falling behind the clock is self-reinforcing: every frame decoded late
+        # is decoded instead of the one actually wanted, so without this the gap
+        # only ever grows and the picture drifts seconds behind the sound.
+        late = self._lateness(position)
+        now = time.monotonic()
+        if (
+            late is not None
+            and late > self._skip_frames
+            and now - self._last_skip >= SKIP_INTERVAL_SECONDS
+        ):
+            # Too far back for decoding to close the gap. Jump, and drop the
+            # queued frames that are all now in the past. Rate-limited, because
+            # if the seek does not close the gap it is due again at once, and
+            # a decoder that only ever seeks shows nothing at all.
+            with self._wake:
+                if generation != self._generation:
+                    return
+                target = self._wanted
+                self._queue.clear()
+            self._last_skip = now
+            self._dropped_run = 0
+            self._do_seek(playlist, target, generation)
+            return
+
+        # Close enough that the stream will catch up on its own, but far enough
+        # that these frames will never be shown. Decode them — the codec needs
+        # them to reach the ones that will be — but skip the colour conversion,
+        # which is the expensive half. Never more than a few in a row: on media
+        # that cannot be decoded in real time the condition never clears, and
+        # dropping unconditionally would mean the viewer is handed nothing for
+        # as long as playback lasts.
+        drop = late is not None and late > self._late_frames
+        if drop and self._dropped_run >= MAX_DROPPED_RUN:
+            drop = False
+        self._dropped_run = self._dropped_run + 1 if drop else 0
 
         # Crossing a clip boundary: open the next source and carry on.
         if segment is None or position >= segment.tl_end:
@@ -296,6 +416,10 @@ class VideoDecoder:
             self._open_for(segment, position)
 
         assert segment is not None
+        if not segment.is_gap and segment.reversed:
+            self._decode_reversed(segment, position, generation)
+            return
+
         if segment.is_gap:
             with self._wake:
                 if generation != self._generation:
@@ -327,6 +451,15 @@ class VideoDecoder:
                     self._segment = None
             return
 
+        if drop:
+            # Nothing is queued: a null image means "gap" downstream and would
+            # blank the viewer. Leaving the last good frame up is right — the
+            # picture holds for a moment instead of flickering to black.
+            with self._wake:
+                if generation == self._generation:
+                    self._position = index + 1
+            return
+
         image = _to_qimage(frame)
         with self._wake:
             if generation != self._generation:
@@ -334,3 +467,26 @@ class VideoDecoder:
             self._queue.append(DecodedFrame(index, image))
             self._position = index + 1
             self._wake.notify_all()
+
+    def _decode_reversed(self, segment: Segment, position: int, generation: int) -> None:
+        """One frame of a clip playing backwards.
+
+        Codecs decode forwards only, so every frame of a reversed clip is a
+        fresh seek plus a short run-up from the preceding keyframe — the same
+        work a scrub does, once per frame. On proxy media, whose GOP is twelve
+        frames, that is a handful of small decodes per displayed frame and the
+        prefetch queue absorbs it. It is deliberately not the buffer-the-whole-
+        clip approach the renderer's `reverse` filter takes: preview must not be
+        able to exhaust memory on a long clip, and dropping a frame here only
+        costs a stutter.
+        """
+        self._open_for(segment, position)
+        if self._decode_at(segment, position, generation):
+            return
+        # The run-up found nothing — treat this frame as spent rather than
+        # spinning on it, and let the next one seek somewhere new.
+        with self._wake:
+            if generation == self._generation:
+                self._position = position + 1
+                if self._position >= segment.tl_end:
+                    self._segment = None

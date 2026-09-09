@@ -31,6 +31,7 @@ from vedit.core.projectfile import SUFFIX, ProjectFileError
 from vedit.pages.audio_page import AudioPage
 from vedit.pages.edit_page import EditPage
 from vedit.pages.media_page import MediaPage
+from vedit.tools import Tool
 from vedit.pages.render_page import RenderPage
 from vedit.player.engine import PlaybackEngine
 from vedit.timeline import ops
@@ -69,6 +70,10 @@ class PageBar(QWidget):
             button.setObjectName("PageButton")
             button.setCheckable(True)
             button.setCursor(Qt.PointingHandCursor)
+            # A tab strip has no business holding the keyboard: clicking one used
+            # to park focus here, outside every page, which left the pages'
+            # shortcuts — Space among them — with nothing to fire from.
+            button.setFocusPolicy(Qt.NoFocus)
             button.setChecked(index == 0)
             self.group.addButton(button, index)
             layout.addWidget(button)
@@ -109,6 +114,7 @@ class MainWindow(QMainWindow):
         # routes into the Edit page live here rather than inside a page.
         self.media_page.append_requested.connect(self.append_media)
         self.media_page.media_activated.connect(self.append_media)
+        self.media_page.status_message.connect(lambda m: self.statusBar().showMessage(m, 6000))
         self.edit_page.status_message.connect(lambda m: self.statusBar().showMessage(m, 6000))
         self.audio_page.status_message.connect(lambda m: self.statusBar().showMessage(m, 6000))
         self.render_page.status_message.connect(lambda m: self.statusBar().showMessage(m, 6000))
@@ -133,6 +139,76 @@ class MainWindow(QMainWindow):
 
         self._build_menus()
         self.statusBar().showMessage("Ready")
+
+    # -- edit-menu entries -----------------------------------------------------
+
+    def _edit_canvas(self):
+        """The Edit page's timeline, which owns these commands.
+
+        The menu is reachable from any page, so it brings you to the one where
+        the thing it does is visible rather than quietly acting off-screen.
+        """
+        if self.stack.currentWidget() is not self.edit_page:
+            self.show_page(1)
+        return self.edit_page.timeline_panel.canvas
+
+    def add_title(self) -> None:
+        self._edit_canvas().add_title()
+
+    def _toggle_reframe(self, on: bool) -> None:
+        self._edit_canvas()
+        self.edit_page.set_tool(Tool.REFRAME if on else Tool.POINTER)
+
+    def _selected_video_clip(self):
+        """The clip the picture and dissolve menus act on.
+
+        The selection if there is one, otherwise whatever is under the playhead
+        — so the menu works when you have simply parked on a shot, which is how
+        you would be looking at it in the first place.
+        """
+        for clip in self.project.selected_clips():
+            if clip.kind == "video" and not clip.is_title:
+                return clip
+        return self.project.timeline.video_clip_at(self.project.playhead)
+
+    def _fill_picture_menu(self) -> None:
+        self.picture_menu.clear()
+        clip = self._selected_video_clip()
+        if clip is None:
+            self.picture_menu.addAction("Select a clip first").setEnabled(False)
+            return
+        canvas = self.edit_page.timeline_panel.canvas
+        canvas._add_picture_menu(self.picture_menu, clip, [clip])
+        # `_add_picture_menu` opens with a separator and its own submenu, which
+        # is right inside a clip's context menu and one level too deep here.
+        nested = next((a.menu() for a in self.picture_menu.actions() if a.menu()), None)
+        if nested is not None:
+            self.picture_menu.clear()
+            for action in nested.actions():
+                self.picture_menu.addAction(action)
+
+    def _fill_dissolve_menu(self) -> None:
+        self.dissolve_menu.clear()
+        clip = self._selected_video_clip()
+        if clip is None:
+            self.dissolve_menu.addAction("Select a clip first").setEnabled(False)
+            return
+        canvas = self.edit_page.timeline_panel.canvas
+        canvas._add_transition_menu(self.dissolve_menu, clip)
+        nested = next((a.menu() for a in self.dissolve_menu.actions() if a.menu()), None)
+        if nested is not None:
+            self.dissolve_menu.clear()
+            for action in nested.actions():
+                self.dissolve_menu.addAction(action)
+
+    def _title_backdrop(self):
+        """A still of what the viewer is showing, for the title dialog to draw
+        over. Writing a caption against a blank rectangle is how you find out it
+        was invisible against the sky only after exporting."""
+        surface = getattr(self.edit_page, "surface", None)
+        if surface is None or not surface.has_image:
+            return None
+        return surface._image
 
     def _build_menus(self) -> None:
         file_menu = self.menuBar().addMenu("&File")
@@ -171,6 +247,36 @@ class MainWindow(QMainWindow):
         self.project.timeline_changed.connect(self._refresh_history_actions)
         self._refresh_history_actions()
 
+        # Everything below used to live only in a checkbox on the transport bar
+        # and in right-click menus on the timeline. That is fine once you know
+        # they are there and no use at all before — the menu bar is the one
+        # place people look for "what can this program do".
+        #
+        # No `setShortcut` on any of them: the real shortcuts are installed
+        # per-page with `WidgetWithChildrenShortcut`, and registering the same
+        # key at window level as well makes Qt call it ambiguous and fire
+        # neither. The key is spelled out in the label instead.
+        edit_menu.addSeparator()
+
+        title_action = QAction("Add &Title…\tCtrl+T", self)
+        title_action.triggered.connect(self.add_title)
+        edit_menu.addAction(title_action)
+
+        self.reframe_action = QAction("&Reframe Picture\tT", self)
+        self.reframe_action.setCheckable(True)
+        self.reframe_action.triggered.connect(self._toggle_reframe)
+        edit_menu.addAction(self.reframe_action)
+        self.edit_page.transport.reframe_toggle.toggled.connect(
+            self.reframe_action.setChecked
+        )
+
+        self.picture_menu = edit_menu.addMenu("&Picture")
+        self.dissolve_menu = edit_menu.addMenu("&Dissolve In")
+        # Rebuilt each time it drops down, because what belongs in it depends
+        # on which clip is selected.
+        self.picture_menu.aboutToShow.connect(self._fill_picture_menu)
+        self.dissolve_menu.aboutToShow.connect(self._fill_dissolve_menu)
+
         view_menu = self.menuBar().addMenu("&View")
         for index, name in enumerate(PAGES):
             action = QAction(f"&{name}", self)
@@ -180,11 +286,17 @@ class MainWindow(QMainWindow):
             view_menu.addAction(action)
 
     def show_page(self, index: int) -> None:
+        page = self.stack.widget(index)
         self.stack.setCurrentIndex(index)
         self.page_bar.select(index)
         # Playback carries on across the switch; only the picture moves.
         if index in VIEWER_PAGES:
-            self.engine.set_surface(self.stack.widget(index).surface)
+            self.engine.set_surface(page.surface)
+        # Hiding a page clears the focus it held, so the incoming page is told to
+        # take it. Without this the window is left with no focus widget and every
+        # page-scoped shortcut is dormant until something is clicked.
+        focus = getattr(page, "focus_default", None)
+        focus() if focus is not None else page.setFocus()
 
     # -- actions ---------------------------------------------------------------
 
