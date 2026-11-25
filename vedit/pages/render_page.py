@@ -344,6 +344,21 @@ class RenderPage(QWidget):
             QMessageBox.warning(self, "Cannot render", str(exc))
             return
 
+        offline = self.project.offline_clip_count()
+        if offline:
+            answer = QMessageBox.warning(
+                self,
+                "Media offline",
+                f"{offline} clip{'s are' if offline != 1 else ' is'} offline and will "
+                "export as black or silence.\n\n"
+                "Relink the missing files from File ▸ Relink Missing Media, "
+                "or render anyway?",
+                QMessageBox.Yes | QMessageBox.Cancel,
+                QMessageBox.Cancel,
+            )
+            if answer != QMessageBox.Yes:
+                return
+
         if output.exists():
             answer = QMessageBox.question(
                 self,

@@ -233,6 +233,11 @@ class MediaPool(QAbstractTableModel):
             self._thumbs.pop(media_id, None)
         self.endResetModel()
 
+    def refresh_durations(self) -> None:
+        """Durations are shown in project frames, so a new rate rewrites them."""
+        if self._items:
+            self.dataChanged.emit(self.index(0, 1), self.index(len(self._items) - 1, 1))
+
     # -- background updates -----------------------------------------------------
 
     def _row_changed(self, media_id: str, column: int) -> None:

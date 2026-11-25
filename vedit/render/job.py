@@ -10,10 +10,14 @@ percentage, instead of the usual trick of scraping the human-readable log.
 
 from __future__ import annotations
 
+import logging
 from enum import Enum
 from pathlib import Path
 
 from PySide6.QtCore import QObject, QProcess, Signal
+
+
+log = logging.getLogger("vedit.render")
 
 
 class JobState(str, Enum):
@@ -109,7 +113,7 @@ class RenderJob(QObject):
             if line.strip():
                 self._stderr_tail.append(line.strip())
         # Only the tail is useful; ffmpeg's opening banter is noise.
-        del self._stderr_tail[:-12]
+        del self._stderr_tail[:-40]
 
     def _error_detail(self) -> str:
         return "\n".join(self._stderr_tail[-4:]) or "ffmpeg failed with no output"
@@ -119,7 +123,17 @@ class RenderJob(QObject):
             return
         self._set_state(JobState.FAILED)
         self.message = self._error_detail()
+        self._log_failure()
         self.finished.emit(False, self.message)
+
+    def _log_failure(self) -> None:
+        """The queue shows four lines; the log keeps the command and the rest."""
+        log.error(
+            "Render of %s failed\n  command: %s\n  %s",
+            self.output,
+            " ".join(self.args),
+            "\n  ".join(self._stderr_tail) or "(no output)",
+        )
 
     def _on_finished(self, code: int, _status) -> None:
         if self.state.finished:
@@ -144,6 +158,7 @@ class RenderJob(QObject):
             self.output.unlink(missing_ok=True)
             self._set_state(JobState.FAILED)
             self.message = self._error_detail()
+            self._log_failure()
             self.finished.emit(False, self.message)
 
     def _set_state(self, state: JobState) -> None:

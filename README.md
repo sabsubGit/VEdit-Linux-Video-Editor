@@ -64,6 +64,37 @@ install them with your distribution's package manager.
 .venv/bin/python -m vedit
 ```
 
+Pass a project file to open it straight away:
+
+```bash
+.venv/bin/python -m vedit ~/Videos/holiday.vedit
+```
+
+## Projects
+
+**Size and frame rate** come from the first clip you put on an empty timeline —
+drop a vertical 60 fps phone clip and the project becomes vertical at 60 fps.
+The status bar says so when it happens. `File ▸ Project Settings` changes it by
+hand; the size can change at any time, the frame rate only while the timeline is
+empty, because every cut is counted in frames at that rate.
+
+**Preview frame rate.** `View ▸ Preview Frame Rate` limits how many pictures a
+second the viewer draws during playback — full, 30, 24, 15 or 10 fps. It only
+thins the preview: sound stays in sync and the export is unaffected. The choice
+is remembered.
+
+**Autosave.** Unsaved work is written every 15 seconds to
+`~/.local/state/vedit/recovery/`, never over your own project file. If vedit
+does not close properly, the next launch offers the work back. Unhandled errors
+are logged to `~/.local/state/vedit/vedit.log`, and failed renders record their
+full ffmpeg command and output there.
+
+**Missing media.** If a file a project uses has moved, its clips stay on the
+timeline in red, marked *Offline*, and play as a gap. `File ▸ Relink Missing
+Media` searches a folder for every missing file by name; right-click an offline
+clip to locate one file by hand, which also picks up its neighbours. A project
+folder moved together with its footage reopens with nothing missing at all.
+
 ## Formats
 
 Import accepts **anything your ffmpeg can demux** — there is no allowlist. That
@@ -92,6 +123,25 @@ segment is normalised before concatenation.
 
 ## Keyboard
 
+`View ▸ Keyboard Layout` switches between vedit's own keys and ones for hands
+trained on **Premiere** or **Resolve**. The choice is remembered, and tooltips
+and menus show whichever keys are in force. Only these differ:
+
+| Action | vedit | Premiere | Resolve |
+|---|---|---|---|
+| Select tool | `V` | `V` | `A` |
+| Cut tool | `C` | `C` | `B` |
+| Split at the playhead | `X` | `Ctrl+K` | `Ctrl+B`, `Ctrl+\` |
+| Ripple delete (closes the gap) | `Delete` | `Shift+Delete` | `Shift+Backspace`, `Delete` |
+| Delete, leaving a gap | `Backspace` | `Delete`, `Backspace` | `Backspace` |
+| Zoom in / out | `+` / `-` | `+` / `-` | `Ctrl++` / `Ctrl+-` |
+| Zoom timeline to fit | `F` | `\` | `Shift+Z` |
+| Snapping on / off | `S` | `S` | `N` |
+
+Everything else is the same in all three. Where the other editor uses a key for
+something vedit does not have (Premiere's `M` is a marker), vedit's meaning is
+kept. The table below is the vedit layout.
+
 | Key | Action |
 |---|---|
 | `Space` | Play / pause |
@@ -107,6 +157,7 @@ segment is normalised before concatenation.
 | `Esc` | Put the tool down |
 | `Ctrl+T` | Add a title at the playhead |
 | `F` | Zoom timeline to fit |
+| `S` | Snapping on / off |
 | `+` / `-` | Zoom in / out |
 | `Ctrl+Z` / `Ctrl+Shift+Z` | Undo / redo |
 | `Ctrl+A` / `Esc` | Select all / deselect |

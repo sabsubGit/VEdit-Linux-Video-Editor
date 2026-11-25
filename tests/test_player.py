@@ -970,3 +970,41 @@ class TestCatchingUpCannotMakeItWorse:
         decoder._dropped_run = 3
         decoder.seek(42)
         assert decoder._dropped_run == 0
+
+
+class TestPreviewFrameRate:
+    """View ▸ Preview Frame Rate: how often playback hands the viewer a picture."""
+
+    def _engine(self, fps):
+        from fractions import Fraction
+
+        from vedit.core.project import Project
+        from vedit.player.engine import PlaybackEngine
+
+        project = Project()
+        project.set_format(1920, 1080, Fraction(fps))
+        project.undo.mark_clean()
+        engine = PlaybackEngine(project)
+        return project, engine
+
+    def test_the_step_follows_the_project_rate(self):
+        project, engine = self._engine(60)
+        try:
+            assert engine._preview_step() == 1, "no limit shows every frame"
+            for limit, step in ((30, 2), (15, 4), (10, 6), (120, 1)):
+                engine.set_preview_fps(limit)
+                assert engine._preview_step() == step
+            engine.set_preview_fps(None)
+            assert engine.preview_fps is None and engine._preview_step() == 1
+        finally:
+            engine.stop()
+            project.shutdown()
+
+    def test_a_limit_at_or_above_the_project_rate_changes_nothing(self):
+        project, engine = self._engine(24)
+        try:
+            engine.set_preview_fps(30)
+            assert engine._preview_step() == 1
+        finally:
+            engine.stop()
+            project.shutdown()

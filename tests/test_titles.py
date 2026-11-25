@@ -636,3 +636,38 @@ class TestGrabbingATitleInTheViewer:
 
         window.project.undo_edit()
         assert window.project.timeline.find(clip.clip_id)[1].title.offset_y == before
+
+
+class TestDialogPlacement:
+    """Dragging the title in the dialog's preview, and keeping it where it was put."""
+
+    def _dialog(self, title):
+        from vedit.timeline.title_dialog import TitleDialog
+
+        return TitleDialog(title, frame=(1920, 1080))
+
+    def test_an_already_placed_title_keeps_its_place_through_an_edit(self):
+        from vedit.timeline.titles import Title
+
+        dialog = self._dialog(Title(text="Name", offset_x=0.2, offset_y=-0.1))
+        dialog.text.setPlainText("Another name")
+        result = dialog.result_title()
+        assert (result.offset_x, result.offset_y) == (0.2, -0.1)
+
+    def test_a_drag_in_the_preview_moves_the_title(self):
+        from vedit.timeline.titles import Title
+
+        dialog = self._dialog(Title())
+        dialog.preview.moved.emit(-0.15, 0.25)
+        result = dialog.result_title()
+        assert (result.offset_x, result.offset_y) == (-0.15, 0.25)
+
+    def test_choosing_a_preset_drops_the_drag_along_that_axis_only(self):
+        from vedit.timeline.titles import Title
+
+        dialog = self._dialog(Title(offset_x=0.2, offset_y=0.3))
+        dialog.position.setCurrentIndex(0)
+        assert dialog.result_title().offset_y == 0.0
+        assert dialog.result_title().offset_x == 0.2
+        dialog.align.setCurrentIndex(0)
+        assert dialog.result_title().offset_x == 0.0

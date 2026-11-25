@@ -18,6 +18,7 @@ from PySide6.QtWidgets import (
 from dataclasses import replace
 
 from vedit import icons, theme
+from vedit.keymap import keymap
 from vedit.tools import BY_TOOL, TOOLS, VIEWER_TOOLS, Tool
 from vedit.core.project import Project
 from vedit.pages.actions import TimelineActions
@@ -74,7 +75,9 @@ class TransportBar(QWidget):
         self.tool_group.setExclusive(True)
         self.tool_buttons: dict[Tool, QToolButton] = {}
         for index, spec in enumerate(TOOLS):
-            button = self._tool_button(spec.icon, spec.tip, spec.key, toggle=True)
+            button = self._tool_button(
+                spec.icon, spec.tip, f"tool.{spec.tool.value}", toggle=True
+            )
             self.tool_group.addButton(button, index)
             self.tool_buttons[spec.tool] = button
         self.tool_buttons[Tool.POINTER].setChecked(True)
@@ -82,17 +85,17 @@ class TransportBar(QWidget):
         # for it, and it is still the thing that arms reframing.
         self.reframe_toggle = self.tool_buttons[Tool.REFRAME]
 
-        self.title_button = self._tool_button("title", "Add a title", "Ctrl+T")
+        self.title_button = self._tool_button("title", "Add a title", "add_title")
         self.dissolve_button = self._tool_button(
             "dissolve", "Cross dissolve into the selected clip", ""
         )
-        self.snap_toggle = self._tool_button("snap", "Snap to edges", "", toggle=True)
+        self.snap_toggle = self._tool_button("snap", "Snap to edges", "snap", toggle=True)
         self.snap_toggle.setChecked(True)
         self.thumbs_toggle = self._tool_button(
             "thumbs", "Show frame thumbnails along video clips", "", toggle=True
         )
         self.thumbs_toggle.setChecked(True)
-        self.fit_button = self._tool_button("fit", "Zoom the timeline to fit", "F")
+        self.fit_button = self._tool_button("fit", "Zoom the timeline to fit", "fit")
 
         layout = QHBoxLayout(self)
         layout.setContentsMargins(10, 6, 10, 6)
@@ -130,7 +133,11 @@ class TransportBar(QWidget):
         self.tool_buttons[tool].setChecked(True)
 
     def _tool_button(self, name: str, what: str, key: str, *, toggle: bool = False):
-        """One icon button. The tooltip carries the words the icon cannot."""
+        """One icon button. The tooltip carries the words the icon cannot.
+
+        `key` is a keymap name, not a key: the tooltip shows whatever that
+        action's key is in the layout in force, and is rewritten when it changes.
+        """
         button = QToolButton(self)
         # Never takes focus: a toolbar that steals the keyboard from the
         # timeline means the next arrow key does nothing.
@@ -139,7 +146,13 @@ class TransportBar(QWidget):
         button.setIconSize(QSize(icons.SIZE, icons.SIZE))
         button.setAutoRaise(True)
         button.setCheckable(toggle)
-        button.setToolTip(f"{what}  ({key})" if key else what)
+        def retip(*_) -> None:
+            shown = keymap.text(key) if key else ""
+            button.setToolTip(f"{what}  ({shown})" if shown else what)
+
+        retip()
+        if key:
+            keymap.changed.connect(retip)
         return button
 
     def _divider(self) -> QWidget:
@@ -243,7 +256,7 @@ class EditPage(QWidget):
         # and has no picture to point them at.
         for spec in TOOLS:
             action = QAction(spec.label, self)
-            action.setShortcut(QKeySequence(spec.key))
+            keymap.bind(action, f"tool.{spec.tool.value}")
             action.setShortcutContext(Qt.WidgetWithChildrenShortcut)
             action.triggered.connect(lambda _=False, t=spec.tool: self.set_tool(t))
             self.addAction(action)
@@ -252,6 +265,20 @@ class EditPage(QWidget):
         # own: two Escape shortcuts in the same scope are ambiguous, and Qt
         # answers an ambiguous shortcut by firing neither.
         self.actions.escape_hook = self._escape_tool
+
+        # Snapping had a button and no key. It is a setting on this page's
+        # tool strip, so its key lives here with the tools.
+        snap = QAction("Snap", self)
+        keymap.bind(snap, "snap")
+        snap.setShortcutContext(Qt.WidgetWithChildrenShortcut)
+        snap.triggered.connect(self._toggle_snap)
+        self.addAction(snap)
+
+    def _toggle_snap(self) -> None:
+        self.transport.snap_toggle.toggle()
+        self.status_message.emit(
+            "Snapping on" if self.transport.snap_toggle.isChecked() else "Snapping off"
+        )
 
     def _escape_tool(self) -> bool:
         """Escape's first job on this page: put down whatever tool is held."""
@@ -319,7 +346,8 @@ class EditPage(QWidget):
 
         spec = BY_TOOL[tool]
         if spec.hint:
-            self.status_message.emit(f"{spec.label}: {spec.hint}")
+            hint = spec.hint.replace("{select}", keymap.text("tool.pointer"))
+            self.status_message.emit(f"{spec.label}: {hint}")
         if tool in VIEWER_TOOLS and self._reframe_clip() is None:
             self.status_message.emit(
                 f"{spec.label}: park the playhead over a clip first"

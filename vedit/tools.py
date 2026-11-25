@@ -48,7 +48,7 @@ TOOLS = (
         icon="cut",
         label="Cut",
         key="C",
-        hint="Click the timeline to cut there. Esc or V to stop cutting.",
+        hint="Click the timeline to cut there. Esc or {select} to stop cutting.",
         tip="Cut clips where you click",
     ),
     ToolSpec(

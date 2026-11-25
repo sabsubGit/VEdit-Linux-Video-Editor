@@ -127,6 +127,26 @@ class UndoStack:
         """Call after saving; `is_dirty` then reports against this point."""
         self._clean_at = len(self._done)
 
+    def mark_dirty(self) -> None:
+        """For a change the history does not record — the project format, a
+        relinked file — which still has to be saved."""
+        self._clean_at = -1
+        self._notify()
+
+    def remap_media(self, old: str, new: str) -> None:
+        """Point every recorded state at a relinked file.
+
+        Without this, undoing past a relink would bring back clips that name
+        the old id, and they would go offline again for no reason the user
+        could see.
+        """
+        for entry in self._done + self._undone:
+            for state in (entry.before, entry.after):
+                for track in state.tracks:
+                    for clip in track.clips:
+                        if clip.media_id == old:
+                            clip.media_id = new
+
     @property
     def is_dirty(self) -> bool:
         return len(self._done) != self._clean_at

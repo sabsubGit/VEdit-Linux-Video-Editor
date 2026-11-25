@@ -4,15 +4,20 @@ Plain JSON, and deliberately readable: a project is small, and being able to ope
 one in a text editor to see what an edit actually did is worth more than a compact
 binary format.
 
-Media is referenced by absolute path. Paths move, so loading reports which files
-are missing rather than refusing to open — the timeline is still valid, and the
-user can relink.
+Media is referenced by absolute path, and also by its path relative to the
+project file, so a project folder moved together with its footage still opens.
+Paths move regardless, so loading reports which files are missing rather than
+refusing to open — and keeps their clips. A clip whose media cannot be found is
+*offline*: it stays where it was cut, plays as a gap, and comes back when the
+file is relinked. Dropping it instead would let the next save write the loss
+into the project.
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+import os
+from dataclasses import dataclass, field
 from fractions import Fraction
 from pathlib import Path
 
@@ -53,12 +58,26 @@ class ProjectFileError(Exception):
     """The file is not a project we can open."""
 
 
+@dataclass(frozen=True, slots=True)
+class OfflineMedia:
+    """A file the project refers to that is not where it was left.
+
+    Keeps the id the clips were saved with, so they go on resolving to this
+    entry until the file is found again.
+    """
+
+    media_id: str
+    path: str
+    name: str
+
+
 @dataclass(slots=True)
 class LoadResult:
     timeline: Timeline
     media: list[MediaInfo]
     missing: list[str]          # paths that could not be opened
     playhead: int
+    offline: list[OfflineMedia] = field(default_factory=list)
 
 
 # -- writing ------------------------------------------------------------------
@@ -196,7 +215,33 @@ def _region_from(raw) -> Region | None:
     )
 
 
-def project_to_dict(timeline: Timeline, media: list[MediaInfo], playhead: int = 0) -> dict:
+def _relative(path: str | Path, base: Path | None) -> str | None:
+    """`path` as seen from the project's folder, or None when that means nothing
+    (no folder to measure from, or a different drive)."""
+    if base is None:
+        return None
+    try:
+        return os.path.relpath(str(path), str(base))
+    except ValueError:
+        return None
+
+
+def _media_entry(media_id: str, path: str | Path, name: str, base: Path | None) -> dict:
+    entry = {"media_id": media_id, "path": str(path), "name": name}
+    relative = _relative(path, base)
+    if relative is not None:
+        entry["relpath"] = relative
+    return entry
+
+
+def project_to_dict(
+    timeline: Timeline,
+    media: list[MediaInfo],
+    playhead: int = 0,
+    *,
+    offline: list[OfflineMedia] | tuple = (),
+    base: Path | None = None,
+) -> dict:
     return {
         "format": "vedit-project",
         "version": FORMAT_VERSION,
@@ -211,10 +256,12 @@ def project_to_dict(timeline: Timeline, media: list[MediaInfo], playhead: int = 
         "playhead": playhead,
         # Only media actually used on the timeline is written; an unused pool
         # entry is a UI convenience, not part of the edit.
+        # Offline media is written back exactly as it was read, so saving a
+        # project while a drive is unplugged costs nothing.
         "media": [
-            {"media_id": info.media_id, "path": str(info.path), "name": info.name}
-            for info in media
-        ],
+            _media_entry(info.media_id, info.path, info.name, base) for info in media
+        ]
+        + [_media_entry(item.media_id, item.path, item.name, base) for item in offline],
         "tracks": [
             {
                 "kind": track.kind,
@@ -230,13 +277,30 @@ def project_to_dict(timeline: Timeline, media: list[MediaInfo], playhead: int = 
     }
 
 
-def save_project(path: Path, timeline: Timeline, media: list[MediaInfo], playhead: int = 0) -> Path:
-    """Write atomically, so an interrupted save cannot destroy the old file."""
+def save_project(
+    path: Path,
+    timeline: Timeline,
+    media: list[MediaInfo],
+    playhead: int = 0,
+    *,
+    offline: list[OfflineMedia] | tuple = (),
+    extra: dict | None = None,
+) -> Path:
+    """Write atomically, so an interrupted save cannot destroy the old file.
+
+    `extra` is merged into the top level of the file; the loader ignores keys it
+    does not know, which is what lets an autosave carry a note of where it came
+    from and still be an ordinary project.
+    """
     path = Path(path)
     if path.suffix != SUFFIX:
         path = path.with_suffix(SUFFIX)
 
-    payload = project_to_dict(timeline, media, playhead)
+    payload = project_to_dict(
+        timeline, media, playhead, offline=offline, base=path.resolve().parent
+    )
+    if extra:
+        payload.update(extra)
     temporary = path.with_name(f"{path.stem}.part{path.suffix}")
     temporary.write_text(json.dumps(payload, indent=2), encoding="utf-8")
     temporary.replace(path)
@@ -283,14 +347,37 @@ def load_project(path: Path) -> LoadResult:
     # authority, and it may have been replaced since the project was saved.
     media: list[MediaInfo] = []
     missing: list[str] = []
+    offline: list[OfflineMedia] = []
     remap: dict[str, str] = {}
+    folder = path.resolve().parent
     for entry in payload.get("media", []):
         stored_id = entry.get("media_id", "")
         file_path = entry.get("path", "")
-        try:
-            info = probe(file_path)
-        except UnsupportedMedia:
+        # Where it was, then where it would be if the project and its footage
+        # were moved as one folder.
+        candidates = [file_path]
+        if entry.get("relpath"):
+            candidates.append(str(folder / entry["relpath"]))
+        info = None
+        for candidate in candidates:
+            try:
+                info = probe(candidate)
+                break
+            except UnsupportedMedia:
+                continue
+        if info is None:
             missing.append(file_path)
+            if stored_id:
+                offline.append(
+                    OfflineMedia(
+                        media_id=stored_id,
+                        path=file_path,
+                        name=entry.get("name") or Path(file_path).name,
+                    )
+                )
+                # The clips keep the id they were saved with. Nothing in the
+                # pool answers to it, which is exactly what "offline" means.
+                remap[stored_id] = stored_id
             continue
         media.append(info)
         # media_id is derived from size and mtime, so a re-encoded file gets a
@@ -312,9 +399,9 @@ def load_project(path: Path) -> LoadResult:
         for raw_clip in raw_track.get("clips", []):
             media_id = raw_clip.get("media_id", "")
             if media_id not in remap and not isinstance(raw_clip.get("title"), dict):
-                # Its media is missing; drop the clip rather than fail. A title
-                # is exempt: it has no media to be missing, which is the whole
-                # point of it.
+                # It names media the file never listed, so there is nothing to
+                # relink it to; drop the clip rather than fail. A title is
+                # exempt: it has no media, which is the whole point of it.
                 continue
             try:
                 track.clips.append(
@@ -364,4 +451,5 @@ def load_project(path: Path) -> LoadResult:
         media=media,
         missing=missing,
         playhead=int(payload.get("playhead", 0)),
+        offline=offline,
     )

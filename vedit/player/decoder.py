@@ -153,7 +153,11 @@ class VideoDecoder:
         # cure being worse than the disease; see the constants above.
         self._last_skip = 0.0
         self._dropped_run = 0
-        fps = float(timebase.fps)
+        self.retime()
+
+    def retime(self) -> None:
+        """Recompute what is counted in frames, after the project rate changed."""
+        fps = float(self.timebase.fps)
         self._late_frames = max(2, int(round(LATE_SECONDS * fps)))
         self._skip_frames = max(self._late_frames * 2, int(round(SKIP_SECONDS * fps)))
 

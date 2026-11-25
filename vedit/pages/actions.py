@@ -18,6 +18,7 @@ from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import QWidget
 
 from vedit.core.project import Project
+from vedit.keymap import keymap
 from vedit.player.engine import PlaybackEngine
 from vedit.timeline import ops
 from vedit.timeline.model import TimelineError
@@ -46,10 +47,10 @@ class DeleteActions(QObject):
 
     # -- installation ----------------------------------------------------------
 
-    def _add(self, text: str, shortcut, slot) -> QAction:
+    def _add(self, text: str, name: str, slot) -> QAction:
+        """An action bound by its keymap name, so it follows the chosen layout."""
         action = QAction(text, self.widget)
-        if shortcut is not None:
-            action.setShortcut(QKeySequence(shortcut) if isinstance(shortcut, str) else shortcut)
+        keymap.bind(action, name)
         action.setShortcutContext(Qt.WidgetWithChildrenShortcut)
         action.triggered.connect(slot)
         self.widget.addAction(action)
@@ -62,8 +63,8 @@ class DeleteActions(QObject):
         the pool, this removes a clip from the timeline, and which one fires is
         decided by where the focus is rather than by who installed first.
         """
-        self._add("Ripple Delete", QKeySequence.Delete, self.ripple_delete_selection)
-        self._add("Lift", Qt.Key_Backspace, self.lift_selection)
+        self._add("Ripple Delete", "ripple_delete", self.ripple_delete_selection)
+        self._add("Lift", "lift", self.lift_selection)
 
     # -- deleting --------------------------------------------------------------
 
@@ -121,36 +122,36 @@ class TimelineActions(DeleteActions):
     def _install(self) -> None:
         engine, project = self.engine, self.project
 
-        self._add("Play/Pause", Qt.Key_Space, engine.toggle)
-        self._add("Razor", "X", self.razor_at_playhead)
+        self._add("Play/Pause", "play_pause", engine.toggle)
+        self._add("Razor", "split", self.razor_at_playhead)
         # Ctrl+T rather than plain T, which arms the reframe tool on the Edit
         # page. Both are page-scoped, so the Audio page simply never sees this
         # one fire — it has no video lanes to put a title on.
-        self._add("Add Title", "Ctrl+T", self.add_title)
+        self._add("Add Title", "add_title", self.add_title)
         self.install_delete_shortcuts()
 
-        self._add("Mute Clip", "M", self.toggle_mute_selection)
-        self._add("Reverse Clip", "R", self.toggle_reverse_selection)
+        self._add("Mute Clip", "mute_clip", self.toggle_mute_selection)
+        self._add("Reverse Clip", "reverse_clip", self.toggle_reverse_selection)
 
-        self._add("Previous Frame", Qt.Key_Left, lambda: engine.step(-1))
-        self._add("Next Frame", Qt.Key_Right, lambda: engine.step(1))
-        fps = int(round(float(project.timebase.fps)))
-        self._add("Back 1s", "Shift+Left", lambda: engine.step(-fps))
-        self._add("Forward 1s", "Shift+Right", lambda: engine.step(fps))
-        self._add("Start", Qt.Key_Home, lambda: engine.seek(0))
-        self._add("End", Qt.Key_End, lambda: engine.seek(project.timeline.duration))
+        self._add("Previous Frame", "prev_frame", lambda: engine.step(-1))
+        self._add("Next Frame", "next_frame", lambda: engine.step(1))
+        # Read each time: the project's rate can change after this is built.
+        second = lambda: int(round(float(project.timebase.fps)))  # noqa: E731
+        self._add("Back 1s", "back_second", lambda: engine.step(-second()))
+        self._add("Forward 1s", "forward_second", lambda: engine.step(second()))
+        self._add("Start", "go_start", lambda: engine.seek(0))
+        self._add("End", "go_end", lambda: engine.seek(project.timeline.duration))
 
         # JKL shuttle, the transport every editor's hands already know.
-        self._add("Shuttle Back", "J", self.shuttle_back)
-        self._add("Pause", "K", engine.pause)
-        self._add("Shuttle Forward", "L", self.shuttle_forward)
+        self._add("Shuttle Back", "shuttle_back", self.shuttle_back)
+        self._add("Pause", "pause", engine.pause)
+        self._add("Shuttle Forward", "shuttle_forward", self.shuttle_forward)
 
-        self._add("Zoom In", "=", lambda: self.zoom(ZOOM_STEP))
-        self._add("Zoom In (+)", "+", lambda: self.zoom(ZOOM_STEP))
-        self._add("Zoom Out", "-", lambda: self.zoom(1 / ZOOM_STEP))
-        self._add("Fit", "F", self.panel.canvas.zoom_to_fit)
-        self._add("Select All", QKeySequence.SelectAll, self.select_all)
-        self._add("Deselect", Qt.Key_Escape, self._escape)
+        self._add("Zoom In", "zoom_in", lambda: self.zoom(ZOOM_STEP))
+        self._add("Zoom Out", "zoom_out", lambda: self.zoom(1 / ZOOM_STEP))
+        self._add("Fit", "fit", self.panel.canvas.zoom_to_fit)
+        self._add("Select All", "select_all", self.select_all)
+        self._add("Deselect", "deselect", self._escape)
 
     def _escape(self) -> None:
         """Put the tool down first, and only then clear the selection.

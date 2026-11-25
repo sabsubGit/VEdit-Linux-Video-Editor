@@ -126,17 +126,71 @@ class TestRoundTrip:
 
 
 class TestMissingMedia:
-    def test_missing_file_is_reported_and_clips_dropped(self, project, tmp_path):
-        timeline, media = project
-        path = save_project(tmp_path / "p.vedit", timeline, media)
-
+    def _lose(self, path):
+        """Point the saved project at a file that is not there, either way."""
         payload = json.loads(path.read_text())
         payload["media"][0]["path"] = "/nonexistent/gone.mp4"
+        payload["media"][0].pop("relpath", None)
         path.write_text(json.dumps(payload))
+        return payload["media"][0]["media_id"]
+
+    def test_missing_file_is_reported_and_its_clips_kept_offline(self, project, tmp_path):
+        timeline, media = project
+        path = save_project(tmp_path / "p.vedit", timeline, media)
+        stored_id = self._lose(path)
 
         result = load_project(path)
         assert result.missing == ["/nonexistent/gone.mp4"]
-        # The project still opens; it just has no clips for that media.
+        assert [item.media_id for item in result.offline] == [stored_id]
+        assert result.offline[0].name == "clip.mp4"
+        # The cut survives: dropping the clips would let the next save write
+        # the loss into the project.
+        clips = [clip for track in result.timeline.tracks for clip in track.clips]
+        assert len(clips) == 2
+        assert {clip.media_id for clip in clips} == {stored_id}
+        assert not result.media
+
+    def test_saving_with_media_offline_writes_it_back(self, project, tmp_path):
+        timeline, media = project
+        path = save_project(tmp_path / "p.vedit", timeline, media)
+        self._lose(path)
+
+        first = load_project(path)
+        again = save_project(
+            tmp_path / "again.vedit", first.timeline, first.media, offline=first.offline
+        )
+        second = load_project(again)
+        assert second.missing == ["/nonexistent/gone.mp4"]
+        assert sum(len(track.clips) for track in second.timeline.tracks) == 2
+
+    def test_media_moved_with_the_project_is_found_beside_it(self, project, tmp_path, clip_file):
+        import shutil
+
+        timeline, _ = project
+        old = tmp_path / "old"
+        (old / "footage").mkdir(parents=True)
+        shutil.copy2(clip_file, old / "footage" / "clip.mp4")
+        info = probe(old / "footage" / "clip.mp4")
+        for clip in timeline.all_clips():
+            clip.media_id = info.media_id
+        save_project(old / "p.vedit", timeline, [info])
+
+        new = tmp_path / "new"
+        old.rename(new)
+
+        result = load_project(new / "p.vedit")
+        assert not result.missing
+        assert result.media[0].path == new / "footage" / "clip.mp4"
+        assert sum(len(track.clips) for track in result.timeline.tracks) == 2
+
+    def test_a_clip_naming_media_the_file_never_listed_is_dropped(self, project, tmp_path):
+        timeline, media = project
+        path = save_project(tmp_path / "p.vedit", timeline, media)
+        payload = json.loads(path.read_text())
+        payload["media"] = []
+        path.write_text(json.dumps(payload))
+
+        result = load_project(path)
         assert sum(len(track.clips) for track in result.timeline.tracks) == 0
         assert len(result.timeline.tracks) == 6, "the lanes themselves survive"
 

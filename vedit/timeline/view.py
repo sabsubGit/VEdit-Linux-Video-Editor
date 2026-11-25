@@ -13,6 +13,7 @@ one undo step instead of hundreds.
 from __future__ import annotations
 
 from dataclasses import dataclass, replace
+from pathlib import Path
 from enum import Enum, auto
 
 from PySide6.QtCore import QPoint, QPointF, QRectF, Qt, Signal
@@ -28,11 +29,19 @@ from PySide6.QtGui import (
     QPixmap,
     QPolygon,
 )
-from PySide6.QtWidgets import QHBoxLayout, QMenu, QScrollBar, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QFileDialog,
+    QHBoxLayout,
+    QMenu,
+    QScrollBar,
+    QVBoxLayout,
+    QWidget,
+)
 
 from vedit import icons, theme
+from vedit.keymap import keymap
 from vedit.tools import Tool
-from vedit.core.project import Project
+from vedit.core.project import Project, RelinkError
 from vedit.media.pool import MediaPool
 from vedit.timeline import framing, levels, ops, titles as titles_mod
 from vedit.timeline.model import (
@@ -48,6 +57,8 @@ from vedit.timeline.filmstrip import FilmstripCache, draw_filmstrip
 from vedit.timeline.waveform import WaveformCache, draw_waveform
 
 RULER_HEIGHT = 26
+# The playhead's arrowhead, as the half-width of each row from the top down.
+PLAYHEAD_HEAD = (5, 5, 4, 3, 2, 1, 0)
 HEADER_WIDTH = 108
 VIDEO_TRACK_HEIGHT = 70
 AUDIO_TRACK_HEIGHT = 56
@@ -198,6 +209,10 @@ class TimelineCanvas(QWidget):
         # select-move-trim behaviour every other branch already implements.
         self._tool = Tool.POINTER
         self._cut_frame: int | None = None
+        # Where the scissors are drawn while the Cut tool is held, and the
+        # drawing itself; see `set_tool`.
+        self._cut_pos: QPoint | None = None
+        self._cut_glyph: QPixmap | None = None
         # A zoom region being dragged: which clip, which of its four handles,
         # and the value the drag has reached. Held off the model until release,
         # like every other drag here, so one gesture is one undo step.
@@ -230,13 +245,21 @@ class TimelineCanvas(QWidget):
             return
         self._tool = tool
         self._cut_frame = None
+        self._cut_pos = None
         if tool is Tool.CUT:
-            # Qt has no scissors cursor, so the toolbar's own drawing becomes
-            # one — through `icons.cursor`, which is the version built to
-            # survive being reduced to a one-bit mask. Drawn once here rather
-            # than per mouse move.
-            pixmap = icons.cursor("cut")
-            self.setCursor(QCursor(pixmap, pixmap.width() // 2, pixmap.height() // 2))
+            # The scissors are painted by the timeline itself, under a hidden
+            # pointer, rather than handed to the system as a cursor image. A
+            # custom cursor image is drawn by the compositor on a hardware
+            # plane, and on at least one real setup (Hyprland on NVIDIA) what
+            # reached the screen was garbled while every screenshot of it was
+            # perfect — so it could be neither seen nor fixed from in here.
+            # Anything painted in the widget arrives as the widget does.
+            if self._cut_glyph is None:
+                self._cut_glyph = icons.cursor("cut")
+            self.setCursor(Qt.BlankCursor)
+            # The mouse may already be resting here — the tool was picked with
+            # a key — and a hidden pointer with nothing drawn is a lost one.
+            self._place_cut_pointer(self.mapFromGlobal(QCursor.pos()))
         else:
             self.unsetCursor()
         self.update()
@@ -625,6 +648,7 @@ class TimelineCanvas(QWidget):
 
         self._paint_ruler(painter)
         self._paint_playhead(painter)
+        self._paint_cut_pointer(painter)
         painter.end()
 
     def _paint_lanes(self, painter: QPainter) -> None:
@@ -727,6 +751,12 @@ class TimelineCanvas(QWidget):
                 (theme.CLIP_TITLE_SEL, theme.CLIP_EDGE_SEL)
                 if selected
                 else (theme.CLIP_TITLE, theme.CLIP_TITLE_EDGE)
+            )
+        if self.project.is_offline(clip.media_id):
+            return (
+                (theme.CLIP_OFFLINE_SEL, theme.CLIP_EDGE_SEL)
+                if selected
+                else (theme.CLIP_OFFLINE, theme.CLIP_OFFLINE_EDGE)
             )
         return self._clip_colours_media(clip, selected)
 
@@ -1016,11 +1046,14 @@ class TimelineCanvas(QWidget):
         # would only say the same thing twice — unless the clip is too small
         # for the body, in which case the band is the only place left.
         if available > 12 and not (clip.is_title and self._title_body_fits(rect)):
+            name = clip.name or "clip"
+            if self.project.is_offline(clip.media_id):
+                name = f"Offline — {name}"
             painter.setPen(text_colour)
             painter.drawText(
                 int(cursor),
                 int(baseline),
-                metrics.elidedText(clip.name or "clip", Qt.ElideMiddle, int(available)),
+                metrics.elidedText(name, Qt.ElideMiddle, int(available)),
             )
 
     def _paint_zoom(self, painter: QPainter, clip: Clip, rect: QRectF) -> None:
@@ -1418,12 +1451,28 @@ class TimelineCanvas(QWidget):
         self._painted_playhead = (x, self.scroll_x)
         if x < HEADER_WIDTH:
             return
-        painter.setPen(QPen(theme.PLAYHEAD, 1))
-        painter.drawLine(int(x), 0, int(x), self.content_height())
-        painter.setBrush(QBrush(theme.PLAYHEAD))
-        painter.setPen(Qt.NoPen)
-        painter.drawPolygon(
-            QPolygon([QPoint(int(x) - 5, 0), QPoint(int(x) + 5, 0), QPoint(int(x), 8)])
+        # Whole pixels, filled rather than stroked. The line is one column
+        # wide, so the arrowhead has to be an odd number of columns centred on
+        # that same column; a polygon from x-5 to x+5 is ten wide and centred on
+        # the column's *edge*, which left the line looking a pixel to the right.
+        column = int(x)
+        painter.fillRect(column, 0, 1, self.content_height(), theme.PLAYHEAD)
+        for row, half in enumerate(PLAYHEAD_HEAD):
+            painter.fillRect(column - half, row, half * 2 + 1, 1, theme.PLAYHEAD)
+
+    def _paint_cut_pointer(self, painter: QPainter) -> None:
+        """The scissors, standing in for the pointer while Cut is held.
+
+        Last and unclipped, because it is the pointer: it has to stay visible
+        over the ruler and the track names as well as the lanes.
+        """
+        if self._tool is not Tool.CUT or self._cut_pos is None or self._cut_glyph is None:
+            return
+        glyph = self._cut_glyph
+        painter.drawPixmap(
+            self._cut_pos.x() - glyph.width() // 2,
+            self._cut_pos.y() - glyph.height() // 2,
+            glyph,
         )
 
     def _paint_cut_line(self, painter: QPainter) -> None:
@@ -1568,14 +1617,28 @@ class TimelineCanvas(QWidget):
             self._drag_clips = ops.expand_links(self.timeline, [hit.clip])
         self.update()
 
+    def _place_cut_pointer(self, pos: QPoint) -> None:
+        """Put the scissors, and the cut preview, where the mouse is."""
+        if not self.rect().contains(pos):
+            return
+        inside = pos.x() >= HEADER_WIDTH and pos.y() >= RULER_HEIGHT
+        self._cut_frame = max(0, self.frame_of(pos.x())) if inside else None
+        self._cut_pos = pos
+        self.update()
+
+    def enterEvent(self, event) -> None:
+        # Arriving is not moving: a pointer can come to rest here without a
+        # single move event (a window appearing under it, a warp), and it is
+        # hidden from that moment.
+        if self._tool is Tool.CUT:
+            self._place_cut_pointer(event.position().toPoint())
+        super().enterEvent(event)
+
     def mouseMoveEvent(self, event) -> None:
         if self._tool is Tool.CUT:
-            pos = event.position().toPoint()
-            inside = pos.x() >= HEADER_WIDTH and pos.y() >= RULER_HEIGHT
-            frame = max(0, self.frame_of(pos.x())) if inside else None
-            if frame != self._cut_frame:
-                self._cut_frame = frame
-                self.update()
+            # Every move, not only when the frame changes: the scissors follow
+            # the mouse pixel by pixel even when the cut line does not.
+            self._place_cut_pointer(event.position().toPoint())
             return
         self._move_event(event)
 
@@ -1727,8 +1790,9 @@ class TimelineCanvas(QWidget):
         if self._zoom_hover is not None:
             self._zoom_hover = None
             self.update()
-        if self._cut_frame is not None:
+        if self._cut_frame is not None or self._cut_pos is not None:
             self._cut_frame = None
+            self._cut_pos = None
             self.update()
         super().leaveEvent(event)
 
@@ -1969,11 +2033,41 @@ class TimelineCanvas(QWidget):
             replace(clip.zoom, framing=framing.with_zoom(clip.zoom.framing, factor)),
         )
 
+    def _locate_media(self, clip: Clip) -> None:
+        """Ask where an offline clip's file went, and relink it."""
+        item = self.project.offline.get(clip.media_id)
+        if item is None:
+            return
+        start = Path(item.path).parent
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            f"Locate {item.name}",
+            str(start if start.is_dir() else Path.home() / item.name),
+        )
+        if not path:
+            return
+        try:
+            found = self.project.locate(item.media_id, path)
+        except RelinkError as exc:
+            self.status_message.emit(f"Not relinked: {exc}")
+            return
+        left = len(self.project.offline_media())
+        message = f"Relinked {len(found)} file{'s' if len(found) != 1 else ''}"
+        if left:
+            message += f"; {left} still offline"
+        self.status_message.emit(message)
+
     def build_clip_menu(self, clip: Clip) -> QMenu:
         menu = QMenu(self)
         selected = self.project.selected_clips() or [clip]
 
-        menu.addAction("Cut at Playhead\tX", self._razor_here)
+        if self.project.is_offline(clip.media_id):
+            # First, because until it is done nothing else on this menu will
+            # show or sound like anything.
+            menu.addAction("Locate Missing File…", lambda: self._locate_media(clip))
+            menu.addSeparator()
+
+        menu.addAction(keymap.labelled("Cut at Playhead", "split"), self._razor_here)
         menu.addSeparator()
 
         speed_menu = menu.addMenu("Speed")
@@ -1988,7 +2082,7 @@ class TimelineCanvas(QWidget):
         if clip.speed != 1.0:
             menu.addAction(f"Reset Speed (now {clip.speed:g}×)", lambda: self._apply_speed(1.0))
 
-        backwards = menu.addAction("Reverse\tR")
+        backwards = menu.addAction(keymap.labelled("Reverse", "reverse_clip"))
         backwards.setCheckable(True)
         backwards.setChecked(clip.reversed)
         backwards.triggered.connect(lambda: self._toggle_reversed(selected))
@@ -2008,7 +2102,9 @@ class TimelineCanvas(QWidget):
         muted_now = self._muted_state(selected)
         if muted_now is not None:
             menu.addSeparator()
-            mute = menu.addAction(("Unmute Clip" if muted_now else "Mute Clip") + "\tM")
+            mute = menu.addAction(
+                keymap.labelled("Unmute Clip" if muted_now else "Mute Clip", "mute_clip")
+            )
             mute.setCheckable(True)
             mute.setChecked(muted_now)
             mute.triggered.connect(lambda: self._toggle_mute(selected))
@@ -2036,8 +2132,14 @@ class TimelineCanvas(QWidget):
                 )
 
         menu.addSeparator()
-        menu.addAction("Delete (leave gap)\tBackspace", lambda: self._delete(selected, ripple=False))
-        menu.addAction("Ripple Delete\tDelete", lambda: self._delete(selected, ripple=True))
+        menu.addAction(
+            keymap.labelled("Delete (leave gap)", "lift"),
+            lambda: self._delete(selected, ripple=False),
+        )
+        menu.addAction(
+            keymap.labelled("Ripple Delete", "ripple_delete"),
+            lambda: self._delete(selected, ripple=True),
+        )
         return menu
 
     # Enough to punch in on a face or crop a wobbly edge without hunting for a
@@ -2240,7 +2342,9 @@ class TimelineCanvas(QWidget):
         menu = QMenu(self)
 
         if track.kind == "video":
-            menu.addAction("Add Title Here…\tCtrl+T", lambda: self.add_title(track))
+            menu.addAction(
+                keymap.labelled("Add Title Here…", "add_title"), lambda: self.add_title(track)
+            )
             menu.addSeparator()
 
         mute = menu.addAction("Mute" if not track.muted else "Unmute")
@@ -2533,10 +2637,18 @@ class TimelineCanvas(QWidget):
         target = row[0] if row else None
 
         placed = 0
+        matched = None
         for media_id in media_ids:
             info = self.project.media_for(media_id)
             if info is None:
                 continue
+            # The first clip onto an empty timeline sets the project's format.
+            # The drop position was measured at the old rate, so it follows.
+            rate_before = self.project.timebase.fps
+            adopted = self.project.match_format(info)
+            if adopted:
+                matched = adopted
+                frame = int(round(frame * self.project.timebase.fps / rate_before))
             try:
                 clips = self.project.edit(
                     f"Add {info.name}",
@@ -2562,6 +2674,12 @@ class TimelineCanvas(QWidget):
 
         if placed:
             event.acceptProposedAction()
+            if matched:
+                self.status_message.emit(
+                    f"Project set to {matched} to match the first clip — "
+                    "change it in File ▸ Project Settings"
+                )
+                self.zoom_to_fit()
         self.update()
 
 

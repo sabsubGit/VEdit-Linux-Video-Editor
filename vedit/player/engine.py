@@ -62,6 +62,10 @@ class PlaybackEngine(QObject):
 
         self._playing = False
         self._speed = 1.0
+        # Ceiling on how often the viewer is given a new picture during
+        # playback, in frames per second; None shows every project frame. Sound,
+        # the clock and the export are untouched — this only thins what is drawn.
+        self._preview_fps: float | None = None
         self._position = 0
         # Set while a reframe drag is in flight; see `preview_picture`.
         self._preview_picture: Framing | None = None
@@ -81,15 +85,56 @@ class PlaybackEngine(QObject):
 
         # Tick a little faster than the frame rate so we never systematically
         # miss a presentation deadline by rounding.
-        interval = max(4, int(1000 / (float(project.timebase.fps) * 2)))
         self._timer = QTimer(self)
         self._timer.setTimerType(Qt.PreciseTimer)
-        self._timer.setInterval(interval)
+        self._timer.setInterval(self._tick_interval())
         self._timer.timeout.connect(self._tick)
         self._timer.start()
 
+        project.format_changed.connect(self._on_format_changed)
+        project.media_relinked.connect(self._on_media_relinked)
         project.timeline_changed.connect(self.invalidate)
         project.playhead_changed.connect(self._on_playhead)
+
+    @property
+    def preview_fps(self) -> float | None:
+        return self._preview_fps
+
+    def set_preview_fps(self, fps: float | None) -> None:
+        """Limit the preview's frame rate during playback. None for no limit."""
+        self._preview_fps = float(fps) if fps and fps > 0 else None
+
+    def _preview_step(self) -> int:
+        """Project frames between pictures: 1 shows them all, 2 every other."""
+        if self._preview_fps is None:
+            return 1
+        return max(1, round(float(self.project.timebase.fps) / self._preview_fps))
+
+    def _tick_interval(self) -> int:
+        return max(4, int(1000 / (float(self.project.timebase.fps) * 2)))
+
+    def _on_format_changed(self) -> None:
+        """The project's size or frame rate changed under us.
+
+        The decoders share the project's timebase, so they are already counting
+        at the new rate; what is left is everything derived from it once.
+        """
+        if self._playing:
+            self.pause()
+        self._timer.setInterval(self._tick_interval())
+        self.video.retime()
+        self.dissolve.retime()
+        if self.surface is not None:
+            timeline = self.project.timeline
+            self.surface.set_frame_size(timeline.width, timeline.height)
+        self.invalidate()
+
+    def _on_media_relinked(self) -> None:
+        """Show the frame that has just become available, rather than leaving
+        the viewer black until the playhead next moves."""
+        self._stale = True
+        if not self._playing:
+            self.seek(self._position)
 
     # -- viewer -----------------------------------------------------------------
 
@@ -288,7 +333,16 @@ class PlaybackEngine(QObject):
                 self._position = target
                 self._announce(target)
 
-        decoded = self.video.frame_for(target)
+        # A limited preview simply does not ask until enough frames have gone
+        # by. The decoder drops whatever was queued in between on the next
+        # request, exactly as it does when it has fallen behind. Parked, every
+        # frame is still shown: stepping must land on the frame asked for.
+        held = (
+            self._playing
+            and self._shown_frame is not None
+            and 0 <= target - self._shown_frame < self._preview_step()
+        )
+        decoded = None if held else self.video.frame_for(target)
         if decoded is None and not self._playing:
             # While parked, show whatever arrived even if it is not an exact
             # match — an approximate frame beats a blank viewer during a scrub.

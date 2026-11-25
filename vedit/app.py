@@ -9,11 +9,12 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PySide6.QtCore import QEvent, Qt, QTimer
-from PySide6.QtGui import QAction, QKeySequence
+from PySide6.QtCore import QEvent, QSettings, Qt, QTimer
+from PySide6.QtGui import QAction, QActionGroup, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
+    QDialog,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -26,8 +27,11 @@ from PySide6.QtWidgets import (
 )
 
 from vedit import theme
-from vedit.core.project import Project
+from vedit.core import crashlog, recovery
+from vedit.core.project import FormatError, Project, describe_format
 from vedit.core.projectfile import SUFFIX, ProjectFileError
+from vedit.keymap import LAYOUT_NAMES, keymap
+from vedit.project_settings import ProjectSettingsDialog
 from vedit.pages.audio_page import AudioPage
 from vedit.pages.edit_page import EditPage
 from vedit.pages.media_page import MediaPage
@@ -44,6 +48,14 @@ VIEWER_PAGES = (1, 2)
 # Pause between dismissing the unsaved-changes dialog and destroying the window.
 # See closeEvent: this is not our bug to fix, but it is cheap to stop provoking.
 DIALOG_SETTLE_MS = 120
+
+# How often unsaved work is written to the recovery file. Short, because the
+# write is a few kilobytes of JSON and is skipped when nothing has changed.
+AUTOSAVE_MS = 15_000
+
+# View ▸ Preview Frame Rate. Zero means every frame of the project.
+PREVIEW_RATES = ((0, "Full (project rate)"), (30, "30 fps"), (24, "24 fps"), (15, "15 fps"), (10, "10 fps"))
+PREVIEW_RATE_KEY = "preview/fps"
 
 
 class PageBar(QWidget):
@@ -140,6 +152,11 @@ class MainWindow(QMainWindow):
         self._build_menus()
         self.statusBar().showMessage("Ready")
 
+        self._autosave_timer = QTimer(self)
+        self._autosave_timer.setInterval(AUTOSAVE_MS)
+        self._autosave_timer.timeout.connect(self.project.autosave)
+        self._autosave_timer.start()
+
     # -- edit-menu entries -----------------------------------------------------
 
     def _edit_canvas(self):
@@ -228,6 +245,20 @@ class MainWindow(QMainWindow):
         import_action.setShortcut(QKeySequence("Ctrl+I"))
         import_action.triggered.connect(self.media_page.pool_panel.choose_files)
         file_menu.addAction(import_action)
+
+        self.relink_action = QAction("&Relink Missing Media…", self)
+        self.relink_action.triggered.connect(self.relink_missing)
+        file_menu.addAction(self.relink_action)
+        # Only live when something is actually missing, checked as the menu
+        # opens rather than tracked.
+        file_menu.aboutToShow.connect(
+            lambda: self.relink_action.setEnabled(bool(self.project.offline_media()))
+        )
+        file_menu.addSeparator()
+
+        settings_action = QAction("Project Se&ttings…", self)
+        settings_action.triggered.connect(self.project_settings)
+        file_menu.addAction(settings_action)
         file_menu.addSeparator()
 
         quit_action = QAction("&Quit", self)
@@ -258,17 +289,26 @@ class MainWindow(QMainWindow):
         # neither. The key is spelled out in the label instead.
         edit_menu.addSeparator()
 
-        title_action = QAction("Add &Title…\tCtrl+T", self)
+        title_action = QAction(self)
         title_action.triggered.connect(self.add_title)
         edit_menu.addAction(title_action)
 
-        self.reframe_action = QAction("&Reframe Picture\tT", self)
+        self.reframe_action = QAction(self)
         self.reframe_action.setCheckable(True)
         self.reframe_action.triggered.connect(self._toggle_reframe)
         edit_menu.addAction(self.reframe_action)
         self.edit_page.transport.reframe_toggle.toggled.connect(
             self.reframe_action.setChecked
         )
+
+        # Their keys are shown, not bound (see above), so the labels are
+        # rewritten whenever the keyboard layout changes.
+        def relabel(*_) -> None:
+            title_action.setText(keymap.labelled("Add &Title…", "add_title"))
+            self.reframe_action.setText(keymap.labelled("&Reframe Picture", "tool.reframe"))
+
+        relabel()
+        keymap.changed.connect(relabel)
 
         self.picture_menu = edit_menu.addMenu("&Picture")
         self.dissolve_menu = edit_menu.addMenu("&Dissolve In")
@@ -284,6 +324,63 @@ class MainWindow(QMainWindow):
             action.setShortcut(QKeySequence(f"Shift+{index + 1}"))
             action.triggered.connect(lambda _=False, i=index: self.show_page(i))
             view_menu.addAction(action)
+
+        view_menu.addSeparator()
+        rate_menu = view_menu.addMenu("Preview &Frame Rate")
+        self.preview_rate_group = QActionGroup(self)
+        saved = self._settings().value(PREVIEW_RATE_KEY, 0, type=int)
+        if saved not in [rate for rate, _ in PREVIEW_RATES]:
+            saved = 0
+        for rate, label in PREVIEW_RATES:
+            action = QAction(label, self)
+            action.setCheckable(True)
+            action.setChecked(rate == saved)
+            action.triggered.connect(lambda _=False, r=rate: self.set_preview_rate(r))
+            self.preview_rate_group.addAction(action)
+            rate_menu.addAction(action)
+        self.engine.set_preview_fps(saved or None)
+
+        keys_menu = view_menu.addMenu("&Keyboard Layout")
+        self.keyboard_group = QActionGroup(self)
+        for layout, label in LAYOUT_NAMES.items():
+            action = QAction(label, self)
+            action.setCheckable(True)
+            action.setChecked(layout == keymap.layout)
+            action.triggered.connect(lambda _=False, name=layout: self.set_keyboard_layout(name))
+            self.keyboard_group.addAction(action)
+            keys_menu.addAction(action)
+
+    @staticmethod
+    def _settings() -> QSettings:
+        return QSettings("vedit", "vedit")
+
+    def set_keyboard_layout(self, layout: str) -> None:
+        """Switch every shortcut to another editor's keys. Remembered."""
+        keymap.set_layout(layout)
+        for name, action in zip(LAYOUT_NAMES, self.keyboard_group.actions()):
+            action.setChecked(name == layout)
+        self.statusBar().showMessage(
+            f"Keyboard layout: {LAYOUT_NAMES[layout]} — "
+            f"cut tool {keymap.text('tool.cut')}, split {keymap.text('split')}, "
+            f"ripple delete {keymap.text('ripple_delete')}",
+            8000,
+        )
+
+    def set_preview_rate(self, fps: int) -> None:
+        """How many pictures a second the viewer draws while playing.
+
+        Only the preview: sound stays in sync and the export is unaffected.
+        """
+        self.engine.set_preview_fps(fps or None)
+        self._settings().setValue(PREVIEW_RATE_KEY, int(fps))
+        for (rate, _), action in zip(PREVIEW_RATES, self.preview_rate_group.actions()):
+            action.setChecked(rate == fps)
+        self.statusBar().showMessage(
+            f"Preview limited to {fps} fps — the export is not affected"
+            if fps
+            else "Preview shows every frame",
+            5000,
+        )
 
     def show_page(self, index: int) -> None:
         page = self.stack.widget(index)
@@ -305,13 +402,40 @@ class MainWindow(QMainWindow):
         info = self.project.media_for(media_id)
         if info is None:
             return
+        matched = self.project.match_format(info)
         try:
             self.project.edit(f"Append {info.name}", lambda t: ops.append_media(t, info))
         except Exception as exc:  # noqa: BLE001 - surfaced to the user, not swallowed
             self.statusBar().showMessage(str(exc), 8000)
             return
         self.show_page(1)
-        self.statusBar().showMessage(f"Appended {info.name}", 4000)
+        if matched:
+            self.edit_page.timeline_panel.canvas.zoom_to_fit()
+            self.statusBar().showMessage(
+                f"Appended {info.name} — project set to {matched} to match it "
+                "(File ▸ Project Settings to change)",
+                9000,
+            )
+        else:
+            self.statusBar().showMessage(f"Appended {info.name}", 4000)
+
+    def project_settings(self) -> None:
+        dialog = ProjectSettingsDialog(self.project, self)
+        accepted = dialog.exec() == QDialog.Accepted
+        chosen = dialog.chosen()
+        dialog.deleteLater()
+        if not accepted:
+            return
+        try:
+            changed = self.project.set_format(*chosen)
+        except FormatError as exc:
+            self.statusBar().showMessage(str(exc), 8000)
+            return
+        if changed:
+            self._update_title()
+            self.statusBar().showMessage(
+                f"Project is now {describe_format(*self.project.format)}", 5000
+            )
 
     def _on_import_failed(self, path: str, reason: str) -> None:
         self.statusBar().showMessage(f"Could not import {path}: {reason}", 8000)
@@ -376,27 +500,119 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(
             self, "Open project", "", f"vedit projects (*{SUFFIX});;All files (*)"
         )
-        if not path:
-            return
+        if path:
+            self.open_path(path)
+
+    def open_path(self, path: str) -> bool:
+        """Open a project file. The caller has dealt with unsaved changes."""
         try:
             result = self.project.load_from(path)
         except ProjectFileError as exc:
             QMessageBox.warning(self, "Cannot open project", str(exc))
-            return
+            return False
+        self._after_load(result)
+        self.statusBar().showMessage(f"Opened {Path(path).name}", 4000)
+        return True
 
-        self.engine.invalidate()
+    def _after_load(self, result) -> None:
+        # A seek rather than a bare invalidate: parked on the same frame number
+        # as before, nothing else would replace the previous project's picture.
+        self.engine.seek(self.project.playhead)
         self.edit_page.timeline_panel.canvas.zoom_to_fit()
         self._update_title()
+        if result.offline:
+            self._offer_relink()
 
-        if result.missing:
-            listed = "\n".join(result.missing[:8])
-            QMessageBox.warning(
-                self,
-                "Missing media",
-                f"{len(result.missing)} file(s) could not be found and their clips were "
-                f"dropped:\n\n{listed}",
+    def _offer_relink(self) -> None:
+        """Say what is missing and offer to go and find it."""
+        missing = self.project.offline_media()
+        if not missing:
+            return
+        listed = "\n".join(item.path for item in missing[:8])
+        if len(missing) > 8:
+            listed += f"\n… and {len(missing) - 8} more"
+        box = QMessageBox(
+            QMessageBox.Warning,
+            "Missing media",
+            f"{len(missing)} file{'s' if len(missing) != 1 else ''} could not be found:"
+            f"\n\n{listed}\n\n"
+            "Their clips are still on the timeline, marked offline, and will "
+            "come back when the files are found.",
+            QMessageBox.NoButton,
+            self,
+        )
+        locate = box.addButton("Locate Folder…", QMessageBox.AcceptRole)
+        box.addButton("Later", QMessageBox.RejectRole)
+        box.exec()
+        wanted = box.clickedButton() is locate
+        box.deleteLater()
+        if wanted:
+            self.relink_missing()
+
+    def relink_missing(self) -> None:
+        """Search a folder for every offline file, by name."""
+        missing = self.project.offline_media()
+        if not missing:
+            self.statusBar().showMessage("No media is missing", 4000)
+            return
+        folder = QFileDialog.getExistingDirectory(
+            self, "Folder containing the missing media", str(Path.home())
+        )
+        if not folder:
+            return
+        self.project.relink_from_folder(folder)
+        left = len(self.project.offline_media())
+        message = f"Relinked {len(missing) - left} of {len(missing)} missing files"
+        if left:
+            message += (
+                f" — {left} still offline. Right-click an offline clip to "
+                "locate its file by hand."
             )
-        self.statusBar().showMessage(f"Opened {Path(path).name}", 4000)
+        self.statusBar().showMessage(message, 10000)
+
+    def offer_recovery(self) -> None:
+        """Offer back any work a previous run lost by not exiting cleanly."""
+        for autosave in recovery.pending():
+            box = QMessageBox(
+                QMessageBox.Question,
+                "Recover unsaved work?",
+                f"vedit did not close properly last time.\n\n"
+                f"Unsaved changes to “{autosave.name}” were autosaved on "
+                f"{autosave.when}. Recover them?",
+                QMessageBox.NoButton,
+                self,
+            )
+            recover = box.addButton("Recover", QMessageBox.AcceptRole)
+            discard = box.addButton("Discard", QMessageBox.DestructiveRole)
+            box.addButton("Ask Later", QMessageBox.RejectRole)
+            box.setDefaultButton(recover)
+            box.exec()
+            clicked = box.clickedButton()
+            box.deleteLater()
+
+            if clicked is discard:
+                recovery.discard(autosave.path)
+            elif clicked is recover:
+                try:
+                    result = self.project.recover_from(autosave)
+                except ProjectFileError as exc:
+                    QMessageBox.warning(self, "Cannot recover", str(exc))
+                    continue
+                self._after_load(result)
+                self.statusBar().showMessage(
+                    f"Recovered {autosave.name} — save it to keep it", 8000
+                )
+                # One project at a time; anything else waits for next launch.
+                return
+
+    def report_error(self, summary: str) -> None:
+        """An unhandled exception was logged. Keep the work, and say so."""
+        self.project.autosave()
+        self.statusBar().showMessage(
+            f"Something went wrong ({summary}). Your work was autosaved; "
+            f"details are in {crashlog.log_path()}",
+            15000,
+        )
 
     def save_project(self) -> bool:
         if self.project.path is None:
@@ -475,8 +691,24 @@ def main() -> int:
     app.setPalette(theme.palette())
     app.setStyleSheet(theme.stylesheet())
 
+    keymap.load()
     window = MainWindow()
+
+    # Exceptions on other threads are handed to the GUI thread before they
+    # touch a widget.
+    def on_error(summary: str) -> None:
+        QTimer.singleShot(0, window, lambda: window.report_error(summary))
+
+    crashlog.install(on_error)
     window.show()
+
+    project_files = [arg for arg in app.arguments()[1:] if not arg.startswith("-")]
+    if project_files:
+        # Opening a named project comes first; a leftover autosave is offered
+        # on the next plain launch.
+        QTimer.singleShot(0, lambda: window.open_path(project_files[0]))
+    else:
+        QTimer.singleShot(0, window.offer_recovery)
     return app.exec()
 
 

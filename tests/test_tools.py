@@ -87,10 +87,12 @@ class TestTheToolList:
 
 class TestTheCutTool:
     def test_holding_it_changes_the_cursor(self, canvas):
+        # Hidden, because the timeline paints the scissors itself; see
+        # tests/test_cursors.py for why.
         canvas.set_tool(Tool.CUT)
-        assert canvas.cursor().shape() == Qt.BitmapCursor
+        assert canvas.cursor().shape() == Qt.BlankCursor
         canvas.set_tool(Tool.POINTER)
-        assert canvas.cursor().shape() != Qt.BitmapCursor
+        assert canvas.cursor().shape() != Qt.BlankCursor
 
     def test_hovering_previews_where_the_cut_would_land(self, qt_app, canvas):
         """The point of the tool over the X key: you see the frame before you

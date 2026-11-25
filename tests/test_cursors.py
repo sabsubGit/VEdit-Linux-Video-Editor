@@ -104,31 +104,77 @@ class TestItIsLegibleAnywhere:
                     )
 
 
-class TestTheCanvasUsesIt:
-    def test_holding_the_cut_tool_sets_a_bitmap_cursor(self, qt_app, monkeypatch, tmp_path):
-        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
-        from PySide6.QtCore import Qt
+class TestTheCanvasDrawsItItself:
+    """The scissors are painted by the timeline under a hidden pointer.
 
+    Handing the system a cursor image looked right in every screenshot and
+    arrived on a real screen (Hyprland on NVIDIA) garbled: the compositor draws
+    client cursor images on a hardware plane that no capture includes. What the
+    widget paints arrives as the widget does.
+    """
+
+    def _canvas(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
         from vedit.core.project import Project
         from vedit.timeline.view import TimelineCanvas
-        from vedit.tools import Tool
 
         canvas = TimelineCanvas(Project())
-        canvas.set_tool(Tool.CUT)
-        assert canvas.cursor().shape() == Qt.BitmapCursor
+        canvas.resize(900, 300)
+        return canvas
 
-        solid, partial, _ = alpha_histogram(canvas.cursor().pixmap())
-        assert partial == 0, "the canvas must use the cursor-safe drawing"
+    def test_holding_the_cut_tool_hides_the_system_pointer(self, qt_app, monkeypatch, tmp_path):
+        from PySide6.QtCore import Qt
+
+        from vedit.tools import Tool
+
+        canvas = self._canvas(monkeypatch, tmp_path)
+        canvas.set_tool(Tool.CUT)
+        assert canvas.cursor().shape() == Qt.BlankCursor
+        assert canvas.cursor().shape() != Qt.BitmapCursor, "no cursor image is handed over"
+
+    def test_the_scissors_are_painted_where_the_mouse_is(self, qt_app, monkeypatch, tmp_path):
+        from PySide6.QtCore import QEvent, QPoint, QPointF, Qt
+        from PySide6.QtGui import QMouseEvent
+
+        from vedit.tools import Tool
+
+        canvas = self._canvas(monkeypatch, tmp_path)
+        canvas.set_tool(Tool.CUT)
+        without = canvas.grab().toImage()
+
+        at = QPoint(500, 150)
+        qt_app.sendEvent(
+            canvas,
+            QMouseEvent(
+                QEvent.MouseMove, QPointF(at), QPointF(canvas.mapToGlobal(at)),
+                Qt.NoButton, Qt.NoButton, Qt.NoModifier,
+            ),
+        )
+        shown = canvas.grab().toImage()
+
+        def white(image):
+            return {
+                (x, y)
+                for x in range(at.x() - 20, at.x() + 20)
+                for y in range(at.y() - 20, at.y() + 20)
+                if image.pixelColor(x, y).name() == "#ffffff"
+            }
+
+        drawn = white(shown) - white(without)
+        assert len(drawn) > 60, "the scissors should be there"
+        xs = [x for x, _ in drawn]
+        assert abs((min(xs) + max(xs)) / 2 - at.x()) <= 1.5, "and centred on the mouse"
+
+        # Leaving the timeline takes them away with the pointer.
+        qt_app.sendEvent(canvas, QEvent(QEvent.Leave))
+        assert not (white(canvas.grab().toImage()) - white(without))
 
     def test_putting_the_tool_down_restores_the_arrow(self, qt_app, monkeypatch, tmp_path):
-        monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path))
         from PySide6.QtCore import Qt
 
-        from vedit.core.project import Project
-        from vedit.timeline.view import TimelineCanvas
         from vedit.tools import Tool
 
-        canvas = TimelineCanvas(Project())
+        canvas = self._canvas(monkeypatch, tmp_path)
         canvas.set_tool(Tool.CUT)
         canvas.set_tool(Tool.POINTER)
-        assert canvas.cursor().shape() != Qt.BitmapCursor
+        assert canvas.cursor().shape() not in (Qt.BlankCursor, Qt.BitmapCursor)

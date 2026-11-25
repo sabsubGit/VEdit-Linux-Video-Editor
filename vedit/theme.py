@@ -38,6 +38,11 @@ CLIP_TITLE = QColor("#8a6a3d")
 CLIP_TITLE_SEL = QColor("#a8834e")
 CLIP_TITLE_EDGE = QColor("#e6c48d")
 CLIP_BORDER = QColor("#0d0f12")
+# A clip whose media cannot be found. Red because it is the one clip state that
+# changes what the export contains without the user having asked for it.
+CLIP_OFFLINE = QColor("#7a2e2e")
+CLIP_OFFLINE_SEL = QColor("#9a3d3d")
+CLIP_OFFLINE_EDGE = QColor("#e08a8a")
 WAVEFORM = QColor("#c9f0dd")
 # The zoom region's envelope. Warm against the blue of a video clip, so a
 # punch-in is visible on a lane at a glance without being mistaken for a
