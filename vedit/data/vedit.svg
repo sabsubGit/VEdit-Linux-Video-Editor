@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 256 256" width="256" height="256">
+  <!-- vedit: two lanes of clips with a cut through them and the playhead in it.
+       Plain shapes only, no clip paths or filters: launchers render icons with
+       whatever SVG library they have, and the small ones skip both. -->
+  <defs>
+    <linearGradient id="ground" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#262b33"/>
+      <stop offset="1" stop-color="#14171b"/>
+    </linearGradient>
+  </defs>
+  <rect x="16" y="16" width="224" height="224" rx="48" fill="url(#ground)"/>
+  <rect x="17.5" y="17.5" width="221" height="221" rx="46.5" fill="none" stroke="#3a424d" stroke-width="3"/>
+  <!-- video lane: one clip, cut in two -->
+  <rect x="38" y="88" width="68" height="48" rx="9" fill="#4a86c4"/>
+  <rect x="126" y="88" width="92" height="48" rx="9" fill="#3a6ea5"/>
+  <!-- audio lane -->
+  <rect x="38" y="148" width="68" height="42" rx="9" fill="#4aa383"/>
+  <rect x="126" y="148" width="92" height="42" rx="9" fill="#3d8a6b"/>
+  <!-- a little waveform, so the lower lane reads as sound -->
+  <g stroke="#c9f0dd" stroke-width="6" stroke-linecap="round">
+    <path d="M54 163v12M68 158v22M82 165v8M92 161v16M144 164v10M158 158v22M172 165v8M186 160v18M200 164v10"/>
+  </g>
+  <!-- the playhead, sitting in the cut -->
+  <rect x="112" y="64" width="8" height="150" rx="4" fill="#ff4a4a"/>
+  <path d="M94 42h44a6 6 0 0 1 6 6v14a8 8 0 0 1-3 6l-20 17a8 8 0 0 1-10 0L91 68a8 8 0 0 1-3-6V48a6 6 0 0 1 6-6z" fill="#ff4a4a"/>
+</svg>

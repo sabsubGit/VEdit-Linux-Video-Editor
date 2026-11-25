@@ -64,6 +64,18 @@ install them with your distribution's package manager.
 .venv/bin/python -m vedit
 ```
 
+To put vedit in your application launcher, with its icon, and make `.vedit`
+project files open in it:
+
+```bash
+.venv/bin/python -m vedit --install-desktop
+```
+
+That writes a launcher entry, the icons and the file type into
+`~/.local/share` — no root needed — and `--uninstall-desktop` removes them
+again. The entry starts vedit with the Python that ran the install, so run it
+again if you move or recreate the virtual environment.
+
 Pass a project file to open it straight away:
 
 ```bash

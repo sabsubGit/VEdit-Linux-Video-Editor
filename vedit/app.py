@@ -10,7 +10,7 @@ import sys
 from pathlib import Path
 
 from PySide6.QtCore import QEvent, QSettings, Qt, QTimer
-from PySide6.QtGui import QAction, QActionGroup, QKeySequence
+from PySide6.QtGui import QAction, QActionGroup, QIcon, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from vedit import theme
+from vedit import desktop, theme
 from vedit.core import crashlog, recovery
 from vedit.core.project import FormatError, Project, describe_format
 from vedit.core.projectfile import SUFFIX, ProjectFileError
@@ -684,9 +684,19 @@ class MainWindow(QMainWindow):
 
 
 def main() -> int:
+    # Before any window exists: these install or remove the launcher entry and
+    # exit, and must work from a terminal with no display to open one on.
+    handled = desktop.run_command(sys.argv[1:])
+    if handled is not None:
+        return handled
+
     app = QApplication(sys.argv)
     app.setApplicationName("vedit")
     app.setApplicationDisplayName("vedit")
+    # The application id a Wayland shell matches against `vedit.desktop` to find
+    # this window's icon; without it the taskbar shows a blank.
+    app.setDesktopFileName(desktop.APP_ID)
+    app.setWindowIcon(QIcon(str(desktop.icon_file())))
     app.setStyle("Fusion")
     app.setPalette(theme.palette())
     app.setStyleSheet(theme.stylesheet())

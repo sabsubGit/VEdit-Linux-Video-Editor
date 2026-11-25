@@ -26,6 +26,10 @@ vedit = "vedit.__main__:main"
 [tool.setuptools.packages.find]
 include = ["vedit*"]
 
+# The application icon, read at run time and by `vedit --install-desktop`.
+[tool.setuptools.package-data]
+vedit = ["data/*"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = ["slow: runs real ffmpeg renders"]
